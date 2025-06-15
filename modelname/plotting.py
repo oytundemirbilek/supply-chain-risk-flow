@@ -1,13 +1,85 @@
-"""Module to define plotting utilities."""
+"""Module to define plotting utilities to visualize the network and experiment results."""
 
 from __future__ import annotations
 
 import os
+from typing import TYPE_CHECKING
 
+import matplotlib
 import matplotlib.pyplot as plt
+import networkx as nx
 import numpy as np
 import pandas as pd
 import seaborn as sns
+
+matplotlib.use("Qt5Agg")
+
+if TYPE_CHECKING:
+    from matplotlib.backend_bases import MouseEvent, PickEvent
+
+    # from torch_geometric.data import Data as PygData
+
+
+class Graphplot:
+    """"""
+
+    def __init__(self, graph: nx.Graph) -> None:
+        self.figure = None
+        self.axes = None
+        self.graph = graph
+
+    def plot(self) -> None:
+        """"""
+        self.figure, self.axes = plt.subplots(1, 1, figsize=(9, 9))
+        nx.draw_networkx(
+            self.graph,
+            # pos=self.nodes,
+            ax=self.axes,
+            hide_ticks=False,
+            node_size=10,
+            font_size=10,
+            width=0.5,
+            labels=nx.get_node_attributes(self.graph, "ticker_ids"),
+            with_labels=False,
+        )
+        plt.show()
+
+    def add_buttons(self) -> None:
+        """"""
+
+    def on_left_click(self, event: PickEvent):
+        """"""
+        # Logically similar to boxplot clicks.
+
+    def on_hover(self, event: MouseEvent):
+        """"""
+        # Logically similar to boxplot hover.
+
+
+class Boxplot:
+    """"""
+
+    def __init__(self):
+        pass
+
+    def plot(self):
+        """"""
+
+    def on_left_click(self, event: PickEvent):
+        """"""
+
+
+class ConfusionMatrixPlot:
+    """"""
+
+    def __init__(self):
+        pass
+
+    def plot(self):
+        """"""
+
+    def on_left_click(self, event: PickEvent):
+        """"""
 
 
 def plot_results_boxplot(
@@ -39,7 +111,7 @@ def plot_results_boxplot(
             df["Dataset"] = dataset_name
             df["Benchmark"] = benchmark
             if benchmark == "modelname":
-                df["Benchmark"] + df["Benchmark"] + " (ours)"
+                df["Benchmark"] += df["Benchmark"] + " (ours)"
             all_dfs.append(df)
 
     all_combined = pd.concat(all_dfs).reset_index(drop=True)
@@ -87,13 +159,13 @@ def plot_results_boxplot(
         palette=custom_palette,
         width=0.8,
         dodge=True,
-        legend=None,
+        legend=False,
     )
     # ax = sns.swarmplot(
     #     x="Dataset", y="Metric", hue="Benchmark", data=all_combined, dodge=True
     # )
     if metric == "mse":
-        ax.set_ylim([0.0, 0.02])
+        ax.set_ylim((0.0, 0.02))
     plt.xlabel("")
     plt.ylabel("")
     plt.tight_layout()

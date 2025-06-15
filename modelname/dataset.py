@@ -1,211 +1,344 @@
-"""Module for your custom dataset and how it should be treated."""
+"""Utility module for supply chain graph construction functions."""
 
 from __future__ import annotations
 
 import os
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import pandas as pd
 import torch
 from sklearn.model_selection import KFold
-from torch import Tensor
-from torch.utils.data import Dataset
-from torch.utils.data.dataloader import default_collate
+from torch_geometric.data import Data as PygData
+from torch_geometric.transforms import RandomNodeSplit
+from torch_geometric.utils import to_networkx
+
+if TYPE_CHECKING:
+    from networkx import Graph
+    from torch import Tensor
+
 
 ROOT_PATH = os.path.dirname(__file__)
-DATA_PATH = os.path.join(ROOT_PATH, "..", "datasets")
 
 
-def mock_batch_collate_fn(batch_data: list[Tensor]) -> Tensor:
-    """Definition of how the batched data will be treated."""
-    return default_collate(batch_data)
+class SupplyChainNetworkGraph(PygData):
+    """
+    Base class for common functionalities of all supply chain datasets.
 
-
-class BaseDataset(Dataset):
-    """Base class for common functionalities of all datasets."""
+    Examples
+    --------
+    >>> sc_path = os.path.join(ROOT_PATH, "datasets", "my_supply_chain_data.csv")
+    >>> company_path = os.path.join(ROOT_PATH, "datasets", "my_company_data.csv")
+    >>> esg_path = os.path.join(ROOT_PATH, "datasets", "my_esg_data.csv")
+    >>> gbuilder = GraphBuilder(sc_path, company_path, esg_path)
+    >>> pyg_graph = gbuilder.get_pytorch_graph()
+    >>> labels = gbuilder.get_regression_labels()
+    >>> tickers = gbuilder.get_ticker_ids()
+    """
 
     def __init__(
         self,
-        path_to_data: str,
+        edges_df: pd.DataFrame,
+        nodes_df: pd.DataFrame,
+        edge_feature_names: list[str] | None = None,
+        node_feature_names: list[str] | None = None,
+        label_encoding: dict[str, int] | None = None,
+        label_name: str = "esg_score",
+        label_type: Literal["classification", "regression"] = "regression",
+        node_identifier: str = "id",
         mode: str = "inference",
-        n_folds: int = 5,
-        current_fold: int = 0,
-        in_memory: bool = False,
         device: str | torch.device | None = None,
         random_seed: int = 0,
-    ):
-        """
-        Dataset class to initialize data operations, cross validation and preprocessing.
-
-        Parameters
-        ----------
-        path_to_data: string
-            Path where the expected data is stored.
-        mode: string
-            Which split to return, can be 'train', 'validation', 'test', or 'inference'.
-            Use 'inference' to load all data if you have a pretrained model and want to use
-            it in-production.
-        n_folds: integer
-            Number of cross validation folds.
-        current_fold: integer
-            Defines which cross validation fold will be selected for training.
-        in_memory: bool
-            Whether to store all data in memory or not.
-        """
+        **kwargs: Any,
+    ) -> None:
         super().__init__()
-        if current_fold > n_folds:
-            raise ValueError("selected fold index cannot be more than number of folds.")
+        self.edges_df = edges_df
+        self.nodes_df = nodes_df
+
+        self.edge_feature_names = edge_feature_names
+        if edge_feature_names is None:
+            self.edge_feature_names = ["relation_size", "revenue_percentage"]
+
+        self.node_feature_names = node_feature_names
+        if node_feature_names is None:
+            self.node_feature_names = ["pe_ratio_today"]
+
+        self.node_identifier = node_identifier
+        self.label_name = label_name
+        self.label_type = label_type
+        self.label_encoding = label_encoding
+
         self.mode = mode
-        self.n_folds = n_folds
-        self.in_memory = in_memory
-        self.path_to_data = path_to_data
-        self.current_fold = current_fold
+        self.label_name = label_name
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = device
         self.random_seed = random_seed
-        self.n_samples_total = self.get_number_of_samples()
 
-        # Keep half of the data as 'unseen' to be used in inference.
-        self.seen_data_indices, self.unseen_data_indices = self.get_fold_indices(
-            self.n_samples_total, 2
-        )
+    # def init_arrange_splits(self, mode: str) -> None:
+    #     """Assign indices to the train-validation-test-inference splits."""
+    #     if mode == "train":
+    #         labeled_nodes = where(labels are available)
+    #     elif mode == "validation":
+    #         self.subjects_labels = self.seen_subjects_labels[self.val_indices]
+    #     elif mode == "test":
+    #         self.subjects_labels = self.subjects_labels[self.unseen_indices]
+    #     elif mode == "inference":
+    #         unlabeled_nodes = where(labels are missing or to be predicted)
+    #     else:
+    #         raise ValueError(
+    #             "mode should be 'train', 'validation', 'test' or 'inference'"
+    #         )
 
-        if mode != "inference" and in_memory:
-            self.samples_labels = self.get_labels()
-
-        if self.in_memory:
-            self.loaded_samples = self.get_all_samples()
-
-        if mode in {"train", "validation"}:
-            # Here split the 'seen' data to train and validation.
-            if self.in_memory:
-                self.seen_samples_labels = self.samples_labels[self.seen_data_indices]
-                self.seen_samples_data = self.loaded_samples[self.seen_data_indices]
-
-            self.n_samples_seen = len(self.seen_data_indices)
-            self.tr_indices, self.val_indices = self.get_fold_indices(
-                self.n_samples_seen,
-                self.n_folds,
-                self.current_fold,
-            )
-
-        if mode == "train":
-            self.selected_indices = self.tr_indices
-            if self.in_memory:
-                self.samples_labels = self.seen_samples_labels[self.tr_indices]
-                self.loaded_samples = self.seen_samples_data[self.tr_indices]
-        elif mode == "validation":
-            self.selected_indices = self.val_indices
-            if self.in_memory:
-                self.samples_labels = self.seen_samples_labels[self.val_indices]
-                self.loaded_samples = self.seen_samples_data[self.val_indices]
-        elif mode == "test":
-            self.selected_indices = self.unseen_data_indices
-            if self.in_memory:
-                self.samples_labels = self.samples_labels[self.unseen_data_indices]
-                self.loaded_samples = self.loaded_samples[self.unseen_data_indices]
-        elif mode != "inference":
-            raise ValueError(
-                "mode should be 'train', 'validation', 'test', or 'inference'"
-            )
-        if mode == "inference":
-            self.n_samples_in_split = self.n_samples_total
-        else:
-            self.n_samples_in_split = len(self.selected_indices)
-
-    def __getitem__(self, index: int) -> tuple[Tensor, Tensor | None]:
-        """Get one sample."""
-        if self.in_memory:
-            label = (
-                None
-                if self.mode == "inference"
-                else torch.from_numpy(self.samples_labels[index]).to(self.device)
-            )
-            sample_data = torch.from_numpy(self.loaded_samples[index]).to(self.device)
-        else:
-            sample_data, label = self.get_sample_data(index)
-        return self.preprocess(sample_data), label
-
-    def __len__(self) -> int:
-        """Get length of dataset."""
-        return self.n_samples_in_split
-
-    @staticmethod
-    def get_number_of_samples() -> int:
-        """Find how many samples are expected in ALL dataset.
-
-        E.g., number of images in the target folder, number of rows in dataframe.
+    def get_ticker_ids(self) -> pd.Series:
         """
-        with open("./datasets/mock_dataset.csv", encoding="utf-8") as fp:
-            n_lines = len(fp.readlines())
-        return n_lines - 1
-
-    def get_labels(self) -> np.ndarray:
-        """Read and store labels in a numpy array.
+        Get ticker ids from supply chain companies table.
 
         Returns
         -------
-        labels: numpy ndarray
-            An array stores the labels for each sample.
+        pandas Series
+            Pandas column that ticker IDs are located.
         """
-        return pd.read_csv(self.path_to_data)["Label"].values
+        return self.nodes_df[self.node_identifier]
 
-    def get_sample_data(self, index: int) -> tuple[Tensor, Tensor]:
-        """
-        Get one sample data and its label (or any ground truth object).
-
-        If we cannot or do not want to store all the samples in memory, we need to
-        read the data based on selected indices (train, validation or test).
+    @staticmethod
+    def replace_string_nans(df: pd.DataFrame) -> pd.DataFrame:
+        """_summary_
 
         Parameters
         ----------
-        index: integer
-            In-split index of the expected sample.
-            (e.g., 2 means the 3rd sample from validation split if mode is 'validation')
+        df : pd.DataFrame
+            _description_
 
         Returns
         -------
-        tensor: torch Tensor
-            A torch tensor represents the data for the sample.
+        pd.DataFrame
+            _description_
         """
-
-        def skip_unselected(row_idx: int) -> bool:
-            if row_idx == 0:
-                return False
-            return row_idx != (self.selected_indices[index] + 1)
-
-        sample_data_row = pd.read_csv(self.path_to_data, skiprows=skip_unselected)
-        sample_data = (
-            torch.from_numpy(
-                sample_data_row.drop(["Sample ID", "Label"], axis="columns").values
-            )
-            .float()
-            .to(self.device)
+        return df.replace("#N/A Field Not Applicable", np.nan).replace(
+            "#N/A N/A", np.nan
         )
-        sample_label = torch.from_numpy(sample_data_row["Label"].values).to(self.device)
-        return sample_data, sample_label
 
-    def preprocess(self, data: Tensor) -> Tensor:  # noqa: PLR6301
-        """Apply any preprocessing method here."""
-        return data
+    @staticmethod
+    def cast_as_float(df: pd.DataFrame, columns: list[str] | None) -> pd.DataFrame:
+        """_summary_
 
-    def get_all_samples(self) -> np.ndarray:
-        """
-        Convert data from all samples to the Torch Tensor objects to store in a list later.
-
-        This function can be memory-consuming but time-saving, recommended to be used on small datasets.
+        Parameters
+        ----------
+        df : pd.DataFrame
+            _description_
+        columns : list[str]
+            _description_
 
         Returns
         -------
-        all_data: np.ndarray
-            A numpy array represents all data.
+        pd.DataFrame
+            _description_
         """
-        return pd.read_csv(self.path_to_data).drop(["Sample ID", "Label"]).values
+        df[columns] = df[columns].astype(float)
+        return df
+
+    def get_isin_ids(self) -> pd.Series:
+        """
+        Get ISIN ids from supply chain companies table.
+
+        Returns
+        -------
+        pandas Series
+            Pandas column that ISIN IDs are located.
+        """
+        return self.nodes_df["id_isin"]
+
+    def get_regression_labels(self) -> np.ndarray:
+        """
+        Get regression labels from ESG/SFDR output table.
+
+        Returns
+        -------
+        numpy ndarray
+            Labels in a numpy array.
+        """
+        return self.nodes_df[self.label_name].astype(float).to_numpy()
+
+    def get_classification_labels(self) -> np.ndarray:
+        """
+        Get classification labels from ESG/SFDR output table.
+
+        Returns
+        -------
+        numpy ndarray
+            Labels encoded as integers in a numpy array.
+        """
+        if self.label_encoding is None:
+            raise ValueError("Label encoding has to be provided for classification.")
+        return self.nodes_df[self.label_name].map(self.label_encoding).to_numpy()
+
+    def company_name_lookup(self, ticker: str) -> str:
+        """_summary_
+
+        Parameters
+        ----------
+        ticker : str
+            _description_
+
+        Returns
+        -------
+        str
+            _description_
+        """
+        if ticker in self.nodes_df[self.node_identifier].to_numpy():
+            return self.nodes_df[self.nodes_df[self.node_identifier] == ticker][
+                "name"
+            ].item()
+        return "Not Found"
+
+    def company_index_lookup(self, ticker: str) -> int | None:
+        """_summary_
+
+        Parameters
+        ----------
+        ticker : str
+            _description_
+
+        Returns
+        -------
+        int | None
+            _description_
+        """
+        if ticker in self.nodes_df[self.node_identifier].to_numpy():
+            return self.nodes_df[
+                self.nodes_df[self.node_identifier] == ticker
+            ].index.item()
+        return None
+
+    def create_pyg_nodes(self) -> Tensor:
+        """"""
+        nodes = self.nodes_df[self.node_feature_names].to_numpy()
+        return torch.from_numpy(nodes)
+
+    def create_pyg_edges(self) -> tuple[Tensor, Tensor]:
+        """_summary_
+
+        Returns
+        -------
+        tuple[Tensor, Tensor]
+            _description_
+        """
+        self.edges_df = self.replace_string_nans(self.edges_df)
+        self.nodes_df = self.replace_string_nans(self.nodes_df)
+        self.edges_df = self.cast_as_float(self.edges_df, self.edge_feature_names)
+
+        src_indices = torch.from_numpy(
+            self.edges_df["source_company"]
+            .map(self.company_index_lookup, na_action="ignore")
+            .to_numpy()
+        )
+        tgt_indices = torch.from_numpy(
+            self.edges_df["target_company"]
+            .map(self.company_index_lookup, na_action="ignore")
+            .to_numpy()
+        )
+        edge_indices = torch.stack([src_indices, tgt_indices])
+
+        edge_attr = torch.from_numpy(self.edges_df[self.edge_feature_names].to_numpy())
+        # rev_percent = torch.from_numpy(self.edges_df["revenue_percentage"].to_numpy())
+        # edge_attr = torch.stack([rel_size, rev_percent], dim=1)
+
+        return edge_attr, edge_indices
+
+    def create_pyg_labels(
+        self, label_type: Literal["classification", "regression"] = "regression"
+    ) -> Tensor:
+        """_summary_
+
+        Parameters
+        ----------
+        label_type : Literal[&quot;classification&quot;, &quot;regression&quot;], optional
+            _description_, by default "regression"
+
+        Returns
+        -------
+        Tensor
+            _description_
+        """
+        if label_type == "classification":
+            return torch.from_numpy(self.get_classification_labels())
+        if label_type == "regression":
+            return torch.from_numpy(self.get_regression_labels())
+
+    def get_pytorch_graph(self) -> PygData:
+        """_summary_
+
+        Returns
+        -------
+        PygData
+            _description_
+        """
+        edge_attr, edge_index = self.create_pyg_edges()
+        return PygData(
+            x=self.create_pyg_nodes(),
+            edge_index=edge_index,
+            edge_attr=edge_attr,
+            y=self.create_pyg_labels(),
+            ticker_ids=self.get_ticker_ids(),
+            # rel_size=edge_attr[0],
+            # rev_percentage=edge_attr[1],
+        )
+
+    def get_networkx_graph(self) -> Graph:
+        """"""
+        pyg_graph = self.get_pytorch_graph()
+        return to_networkx(
+            pyg_graph,
+            node_attrs=["x", "ticker_ids"],
+            edge_attrs=["edge_attr"],
+            # edge_attrs=["rel_size", "rev_percentage"],
+            # to_multi=True,
+        )
+
+    # def transductive_split(self) -> Tensor:
+
+    #     # Mask 20% of nodes with ESG scores for validation/test
+    #     transform = RandomNodeSplit(split="random", num_val=0.1, num_test=0.1)
+    #     data = transform(data)  # data.train_mask, data.val_mask, data.test_mask
+
+    # def inductive_split(self) -> Tensor:
+    #     # Inductive split (isolate nodes and edges)
+    #     train_mask = torch.rand(data.num_nodes) < 0.7
+    #     val_mask = ~train_mask & (torch.rand(data.num_nodes) < 0.15)
+    #     test_mask = ~train_mask & ~val_mask
+
+    #     # For edges: keep only training-train + train-val/test edges
+    #     edge_train_mask = (train_mask[data.edge_index[0]]) & (
+    #         train_mask[data.edge_index[1]]
+    #     )
+    #     edge_val_mask = (train_mask[data.edge_index[0]]) & (
+    #         val_mask[data.edge_index[1]]
+    #     )
+
+    # def hybrid_split(self) -> Tensor:
+    #     # Transductive mask (semi-supervised)
+    #     data.y = ESG_scores  # Known scores, NaN for missing
+    #     data.train_mask = ~torch.isnan(data.y)  # Start with all known labels
+    #     data.train_mask[random_subset] = False  # Mask some for val/test
+
+    #     # Inductive mask (isolated nodes)
+    #     train_nodes = torch.randperm(data.num_nodes)[: int(0.7 * data.num_nodes)]
+    #     data.train_mask = torch.zeros(data.num_nodes, dtype=bool)
+    #     data.train_mask[train_nodes] = True
+
+    # def __repr__(self) -> str:
+    #     """Dunder function to return string representation of the dataset."""
+    #     return (
+    #         f"{self.__class__.__name__} multigraph dataset ({self.mode}) {self.hemisphere} hemisphere with"
+    #         f", n_subjects={self.n_subj}, current fold:{self.current_fold + 1}/{self.n_folds}"
+    #         f", n_views_source={self.n_views_src}, n_nodes_source={self.n_nodes_src}"
+    #         f", n_views_target={self.n_views_tgt}, n_nodes_target={self.n_nodes_tgt}"
+    #     )
 
     @staticmethod
     def get_fold_indices(
-        all_data_size: int, n_folds: int, fold_id: int = 0
+        all_data_size: int, n_folds: int, fold_id: int = 0, random_seed: int = 0
     ) -> tuple[np.ndarray, np.ndarray]:
         """
         Create folds and get indices of train and validation datasets.
@@ -216,6 +349,8 @@ class BaseDataset(Dataset):
             Size of all data.
         fold_id: int
             Which cross validation fold to get the indices for.
+        random_seed: int
+            Random seed to be used for randomization.
 
         Returns
         -------
@@ -224,36 +359,155 @@ class BaseDataset(Dataset):
         val_indices: numpy ndarray
             Indices to get the validation dataset.
         """
-        kf = KFold(n_splits=n_folds, shuffle=True)
-        split_indices = kf.split(range(all_data_size))
+        kf = KFold(n_splits=n_folds, shuffle=True, random_state=random_seed)
+        split_indices = kf.split(np.array(range(all_data_size)))
         train_indices, val_indices = [
             (np.array(train), np.array(val)) for train, val in split_indices
         ][fold_id]
         # Split train and test
         return train_indices, val_indices
 
-    def __repr__(self) -> str:
-        """Return information about dataset as its string representation."""
-        return (
-            f"{self.__class__.__name__} dataset ({self.mode}) with"
-            f" n_samples={self.n_samples_in_split}, "
-            f"current fold:{self.current_fold + 1}/{self.n_folds}"
-        )
 
-
-class MockDataset(BaseDataset):
-    """Mock dataset."""
+class SLPCNetworkGraph(SupplyChainNetworkGraph):
+    """"""
 
     def __init__(
         self,
+        edges_df: pd.DataFrame,
+        nodes_df: pd.DataFrame,
+        edge_feature_names: list[str] | None = None,
+        node_feature_names: list[str] | None = None,
+        label_encoding: dict[str, int] | None = None,
+        label_name: str = "esg_score",
+        label_type: Literal["classification", "regression"] = "regression",
+        node_identifier: str = "id",
         mode: str = "inference",
-        n_folds: int = 5,
-        current_fold: int = 0,
-        in_memory: bool = False,
         device: str | torch.device | None = None,
         random_seed: int = 0,
     ):
-        mock_data_path = os.path.join(DATA_PATH, "mock_dataset.csv")
         super().__init__(
-            mock_data_path, mode, n_folds, current_fold, in_memory, device, random_seed
+            edges_df=edges_df,
+            nodes_df=nodes_df,
+            edge_feature_names=edge_feature_names,
+            node_feature_names=node_feature_names,
+            label_encoding=label_encoding,
+            label_name=label_name,
+            label_type=label_type,
+            node_identifier=node_identifier,
+            mode=mode,
+            device=device,
+            random_seed=random_seed,
         )
+
+
+class ISSNetworkGraph(SupplyChainNetworkGraph):
+    """"""
+
+    def __init__(
+        self,
+        edges_df: pd.DataFrame,
+        nodes_df: pd.DataFrame,
+        edge_feature_names: list[str] | None = None,
+        node_feature_names: list[str] | None = None,
+        label_encoding: dict[str, int] | None = None,
+        label_name: str = "esg_score",
+        label_type: Literal["classification", "regression"] = "regression",
+        node_identifier: str = "id",
+        mode: str = "inference",
+        device: str | torch.device | None = None,
+        random_seed: int = 0,
+    ):
+        super().__init__(
+            edges_df=edges_df,
+            nodes_df=nodes_df,
+            edge_feature_names=edge_feature_names,
+            node_feature_names=node_feature_names,
+            label_encoding=label_encoding,
+            label_name=label_name,
+            label_type=label_type,
+            node_identifier=node_identifier,
+            mode=mode,
+            device=device,
+            random_seed=random_seed,
+        )
+
+
+class MSCINetworkGraph(SupplyChainNetworkGraph):
+    """"""
+
+    def __init__(
+        self,
+        edges_df: pd.DataFrame,
+        nodes_df: pd.DataFrame,
+        edge_feature_names: list[str] | None = None,
+        node_feature_names: list[str] | None = None,
+        label_encoding: dict[str, int] | None = None,
+        label_name: str = "msci_rating",
+        label_type: Literal["classification", "regression"] = "regression",
+        node_identifier: str = "id",
+        mode: str = "inference",
+        device: str | torch.device | None = None,
+        random_seed: int = 0,
+    ):
+        label_encoding = {
+            "AAA": 10,
+            "AA": 9,
+            "A": 8,  # ...
+        }
+        super().__init__(
+            edges_df=edges_df,
+            nodes_df=nodes_df,
+            edge_feature_names=edge_feature_names,
+            node_feature_names=node_feature_names,
+            label_encoding=label_encoding,
+            label_name=label_name,
+            label_type=label_type,
+            node_identifier=node_identifier,
+            mode=mode,
+            device=device,
+            random_seed=random_seed,
+        )
+
+
+if __name__ == "__main__":
+    FILE_PATH = os.path.dirname(__file__)
+    DATA_PATH = os.path.join(FILE_PATH, "..", "datasets", "bloomberg_cocoa")
+    SC_CUSTOMERS_PATH = os.path.join(
+        DATA_PATH, "cocoa_supply_chain_customers", "cocoa_supply_chain_customers.csv"
+    )
+    COMPANIES_PATH = os.path.join(DATA_PATH, "company_list", "companies_filtered.csv")
+    FINANCIAL_PATH = os.path.join(DATA_PATH, "company_list", "companies_financial.csv")
+    ESG_PATH = os.path.join(DATA_PATH, "esg", "cocoa_sc_esg_env_v2.csv")
+
+    esg_df = pd.read_csv(ESG_PATH)
+    nodes_df = pd.read_csv(COMPANIES_PATH)
+    financial_df = pd.read_csv(FINANCIAL_PATH)
+    sc_df = pd.read_csv(SC_CUSTOMERS_PATH)
+
+    nodes_df = nodes_df.merge(
+        esg_df,
+        left_on="id",
+        right_on="Ticker",
+        suffixes=(None, None),
+        how="left",
+    )
+    nodes_df = nodes_df.merge(financial_df, on="id", suffixes=(None, None), how="left")
+    nodes_df = nodes_df[nodes_df["pe_ratio_today"] != "#N/A"]
+    sc_df = sc_df[sc_df["relation_size"] != "#N/A Field Not Applicable"]
+    sc_df = sc_df[sc_df["source_company"].isin(nodes_df["id"])]
+    sc_df = sc_df[sc_df["target_company"].isin(nodes_df["id"])]
+
+    sc_network = SLPCNetworkGraph(sc_df, nodes_df, label_name="Env Scr")
+    pyg_graph = sc_network.get_pytorch_graph()
+    nx_graph = sc_network.get_networkx_graph()
+
+    import networkx as nx
+
+    print(pyg_graph)
+    # print(nx.get_node_attributes(nx_graph, "x"))
+    # print(nx.get_edge_attributes(nx_graph, "edge_attr"))
+
+    from modelname.plotting import Graphplot
+
+    plotter = Graphplot(nx_graph)
+    plotter.plot()

@@ -10,12 +10,11 @@ keywords = [""]
 readme = "README.rst"
 authors = [{ name="Oytun Demirbilek", email="oytun1996@gmail.com" }]
 license = { file = "LICENSE" }
-requires-python = ">=3.7"
+requires-python = ">=3.8"
 classifiers = [
     "Operating System :: OS Independent",
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.7",
     "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
@@ -27,11 +26,10 @@ classifiers = [
 ]
 
 dependencies = [
-    "numpy<2", # still having problems with older torch versions
+    "numpy",
     "pandas",
     "scikit-learn",
-    "torch; platform_system != 'Linux'",
-    # "torchvision", # if needed
+    "torch; platform_system != 'Linux'", # gh runner should install cpu version.
     "matplotlib",
     "seaborn",
 ]
@@ -201,9 +199,9 @@ addopts = [
     "--strict-markers",
     "--showlocals",
     "--junit-xml=./logs/pytest_junit.xml",
-    "--tb=line",
+    "--tb=short",
     "--cov-config=pyproject.toml",
-    "--cov",
+    "--cov=./modelname/",
     "--cov-branch",
     "--cov-report=term-missing",
     "--cov-report=lcov:./logs/coverage.lcov",
@@ -220,7 +218,7 @@ junit_logging = "all"
 [tool.coverage]
 run.disable_warnings = ["no-data-collected"]
 run.branch = true
-run.omit = ["tests/*"]
+run.omit = ["tests/*", "modelname/__main__.py"]
 report.show_missing = true
 report.fail_under = 70
 report.exclude_also = ["pragma: no cover", "if TYPE_CHECKING:"]
