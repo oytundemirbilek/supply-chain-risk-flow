@@ -75,6 +75,7 @@ class SurfgateNet(Module):
             edge_dim=edge_feat_dim,
             dropout=dropout,
             concat=True,
+            add_self_loops=False,
         )
 
         # Second GATv2 layer
@@ -85,6 +86,7 @@ class SurfgateNet(Module):
             edge_dim=edge_feat_dim,
             dropout=dropout,
             concat=True,
+            add_self_loops=False,
         )
 
         # Final linear layer for regression

@@ -7,14 +7,15 @@ import os
 
 import numpy as np
 import torch
+from torch import Tensor
 from torch.nn import Module
-from torch.nn.modules.loss import _Loss
-from torch.optim import AdamW
-from torch.utils.data import DataLoader
+from torch.nn.modules.loss import MSELoss
+from torch.optim import AdamW, Optimizer
+from torch_geometric.data import Data as PygData
+from sklearn.metrics import r2_score
 
-from modelname.dataset import MockDataset, mock_batch_collate_fn
-from modelname.evaluation import MockLoss
-from modelname.model import MockModel
+from modelname.dataset import SLPCNetworkGraph
+from modelname.model import SurfgateNet
 from modelname.utils import EarlyStopping
 
 # We used 35813 (part of the Fibonacci Sequence) as the seed when we conducted experiments
@@ -31,10 +32,9 @@ if torch.cuda.is_available():
 
 FILE_PATH = os.path.dirname(__file__)
 
-DATASETS = {
-    "mock_dataset": MockDataset,
-    "another_mock_dataset": MockDataset,
-}
+# DATASETS = {
+#     "scn_dataset": SupplyChainNetworkDataset,
+# }
 
 
 class BaseTrainer:
@@ -44,7 +44,6 @@ class BaseTrainer:
         self,
         # Data related:
         dataset: str,
-        timepoint: str | None,
         # Training related:
         n_epochs: int,
         learning_rate: float,
@@ -56,7 +55,7 @@ class BaseTrainer:
         n_folds: int = 5,
         layer_sizes: tuple[int, ...] = (8, 16),
         loss_weight: float = 1.0,
-        loss_name: str = "mock_loss",
+        loss_name: str = "mse_loss",
         model_name: str = "default_model_name",
         random_seed: int = 0,
         device: str | None = None,
@@ -68,7 +67,6 @@ class BaseTrainer:
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.random_seed = random_seed
         self.dataset = dataset
-        self.timepoint = timepoint
         self.n_epochs = n_epochs
         self.n_folds = n_folds
         self.batch_size = batch_size
@@ -90,9 +88,8 @@ class BaseTrainer:
         with open(self.model_params_save_path, "w", encoding="utf-8") as f:
             json.dump(self.__dict__, f, indent=4)
 
-        self.loss_fn: _Loss
-        if loss_name == "mock_loss":
-            self.loss_fn = MockLoss()
+        if loss_name == "mse_loss":
+            self.loss_fn = MSELoss()
         else:
             raise NotImplementedError("Specified loss function is not defined.")
 
@@ -102,72 +99,72 @@ class BaseTrainer:
         """Return string representation of the Trainer as training parameters."""
         return str(self.__dict__)
 
+    def train_step(self, model: Module, data: PygData, optimizer: Optimizer):
+        model.train()
+        optimizer.zero_grad()
+
+        out = model.forward(data).squeeze()
+
+        if not isinstance(data.y, Tensor):
+            raise ValueError("Labels should be a tensor.")
+
+        # Primary ESG prediction loss
+        loss_main = self.loss_fn(out[data.train_mask], data.y[data.train_mask])
+
+        # Smoothness loss (optional)
+        # loss_smooth = smoothness_loss(
+        #     out, data.edge_index, data.edge_attr[:, 0]
+        # )  # use revenue_pct as edge weight
+
+        # loss = loss_main + λ * loss_smooth
+        loss_main.backward()
+        optimizer.step()
+
+        return loss_main.item()
+
     @torch.no_grad()
-    def validate(self, model: Module, val_dataloader: DataLoader) -> float:
+    def validate_step(self, model: Module, data: PygData) -> tuple[float, float]:
         """Run validation loop."""
         model.eval()
-        val_losses = []
-        for input_data, target_label in val_dataloader:
-            prediction = model(input_data)
-            val_loss = self.loss_fn(prediction, target_label)
-            val_losses.append(val_loss)
+        out = model.forward(data).squeeze()
+
+        if not isinstance(data.y, Tensor):
+            raise ValueError("Labels should be a tensor.")
+
+        # Primary ESG prediction loss
+        loss_main = self.loss_fn(out[data.val_mask], data.y[data.val_mask])
+        r2 = r2_score(
+            data.y[data.val_mask].cpu().numpy(), out[data.val_mask].cpu().numpy()
+        )
 
         model.train()
-        return torch.stack(val_losses).mean().item()
+        return loss_main.item(), r2
 
     def train(self, current_fold: int = 0) -> Module:
         """Train model."""
-        tr_dataset = DATASETS[self.dataset](
-            mode="train",
-            n_folds=self.n_folds,
-            current_fold=current_fold,
-            random_seed=self.random_seed,
-            device=self.device,
-        )
-        val_dataset = DATASETS[self.dataset](
-            mode="validation",
-            n_folds=self.n_folds,
-            current_fold=current_fold,
-            random_seed=self.random_seed,
-            device=self.device,
-        )
-        tr_dataloader = DataLoader(
-            tr_dataset,
-            batch_size=self.batch_size,
-            collate_fn=mock_batch_collate_fn,
-        )
-        val_dataloader = DataLoader(
-            val_dataset,
-            batch_size=self.batch_size,
-            collate_fn=mock_batch_collate_fn,
-        )
-        model = MockModel(
-            in_features=3,
-            out_features=1,
-            batch_size=self.batch_size,
-            layer_sizes=self.layer_sizes,
-        ).to(self.device)
+        data = SLPCNetworkGraph(device=self.device)
+        data = data.get_pytorch_graph()
+        data.transductive_split()
+        # print(data)
+        model = SurfgateNet(1, 2, 32, 2, 1).to(self.device)
         optimizer = AdamW(
             model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay
         )
         early_stopping = EarlyStopping(self.patience)
         best_loss = 99999999999999999999999.0
         for epoch in range(self.n_epochs):
-            tr_losses = []
-            for input_data, target_data in tr_dataloader:
-                pred_data = model(input_data)
-                tr_loss = self.loss_fn(pred_data, target_data)
-                optimizer.zero_grad()
-                tr_loss.backward()
-                optimizer.step()
-                tr_losses.append(tr_loss.detach())
-            avg_tr_loss = torch.stack(tr_losses).mean().item()
+            train_loss = self.train_step(model, data, optimizer)
+
             if (epoch + 1) % self.validation_period == 0:
-                val_loss = self.validate(model, val_dataloader)
+                val_loss, val_r2 = self.validate_step(model, data)
                 print(
-                    f"Epoch: {epoch + 1}/{self.n_epochs} | Tr.Loss: {avg_tr_loss} | Val.Loss: {val_loss}"
+                    f"Epoch: {epoch + 1}/{self.n_epochs}",
+                    f" | Tr.Loss: {train_loss}",
+                    f" | Val.Loss: {val_loss}",
+                    f" | Val.R2: {val_r2}",
                 )
                 self.val_loss_per_epoch.append(val_loss)
+
                 early_stopping.step(val_loss)
                 if early_stopping.check_patience():
                     break
@@ -185,8 +182,9 @@ class BaseTrainer:
 if __name__ == "__main__":
     trainer = BaseTrainer(
         dataset="mock_dataset",
-        timepoint=None,
-        n_epochs=100,
-        learning_rate=0.01,
+        n_epochs=1000,
+        learning_rate=0.001,
+        validation_period=10,
+        # device="cpu",
     )
     trainer.train()
