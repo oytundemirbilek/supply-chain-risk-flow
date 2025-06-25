@@ -10,6 +10,8 @@ import pandas as pd
 import torch
 from torch import Tensor
 from sklearn.model_selection import KFold
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+
 from torch_geometric.data import Data as PygData
 from torch_geometric.utils import to_networkx
 
@@ -52,8 +54,8 @@ class SupplyChainNetworkGraph(PygData):
         **kwargs: Any,
     ) -> None:
         super().__init__()
-        self.edges_df = edges_df
-        self.nodes_df = nodes_df
+        self.edges_df: pd.DataFrame = edges_df
+        self.nodes_df: pd.DataFrame = nodes_df
 
         self.edge_feature_names = edge_feature_names
         if edge_feature_names is None:
@@ -220,6 +222,33 @@ class SupplyChainNetworkGraph(PygData):
     #     data.train_mask = torch.zeros(data.num_nodes, dtype=bool)
     #     data.train_mask[train_nodes] = True
 
+    def normalize_esg(self, df: pd.DataFrame, column: str) -> pd.DataFrame:
+        """"""
+        # ESG scores (0-8)
+        esg_normalized = df[column].to_numpy() / 10.0
+        df[f"{column}_original"] = df[column]
+        df[column] = esg_normalized
+        return df
+
+    def normalize_features(self, df: pd.DataFrame, column: str) -> pd.DataFrame:
+        """"""
+        # Node features (P/E ratios)
+        normalized = StandardScaler().fit_transform(
+            df[column].to_numpy().reshape(-1, 1)
+        )
+        df[f"{column}_original"] = df[column]
+        df[column] = normalized
+        return df
+
+    def normalize_with_logscale(self, df: pd.DataFrame, column: str) -> pd.DataFrame:
+        """"""
+        # Edge features (USD relations)
+        log_column = np.log(df[column].to_numpy() + 1e-6)
+        normalized = StandardScaler().fit_transform(log_column.reshape(-1, 1))
+        df[f"{column}_original"] = df[column]
+        df[column] = normalized
+        return df
+
     def get_ticker_ids(self) -> pd.Series:
         """
         Get ticker ids from supply chain companies table.
@@ -288,7 +317,9 @@ class SupplyChainNetworkGraph(PygData):
         numpy ndarray
             Labels in a numpy array.
         """
-        return self.nodes_df[self.label_name].astype(float).to_numpy()
+        self.nodes_df = self.cast_as_float(self.nodes_df, [self.label_name])
+        # self.nodes_df = self.normalize_esg(self.nodes_df, self.label_name)
+        return self.nodes_df[self.label_name].to_numpy()
 
     def get_classification_labels(self) -> np.ndarray:
         """
@@ -343,6 +374,9 @@ class SupplyChainNetworkGraph(PygData):
 
     def create_pyg_nodes(self) -> Tensor:
         """"""
+        self.nodes_df = self.replace_string_nans(self.nodes_df)
+        self.nodes_df = self.cast_as_float(self.nodes_df, self.node_feature_names)
+        # self.nodes_df = self.normalize_features(self.nodes_df, "pe_ratio_today")
         nodes = self.nodes_df[self.node_feature_names].to_numpy()
         return torch.from_numpy(nodes).to(self.device)
 
@@ -355,9 +389,8 @@ class SupplyChainNetworkGraph(PygData):
             _description_
         """
         self.edges_df = self.replace_string_nans(self.edges_df)
-        self.nodes_df = self.replace_string_nans(self.nodes_df)
         self.edges_df = self.cast_as_float(self.edges_df, self.edge_feature_names)
-        self.nodes_df = self.cast_as_float(self.nodes_df, self.node_feature_names)
+        # self.edges_df = self.normalize_with_logscale(self.edges_df, "relation_size")
 
         src_indices = torch.from_numpy(
             self.edges_df["source_company"]
