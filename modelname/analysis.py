@@ -17,19 +17,21 @@ from modelname.utils import (
 )
 from modelname.plotting import Graphplot, Boxplot
 
-nodes_df = read_company_data()
-sc_customers_df, sc_suppliers_df = read_supply_chain_data(normalize=True, alpha=0.5)
-sc_customers_df = select_companies(
-    sc_customers_df, nodes_df["id"].tolist(), "target_company"
+nodes_df = read_company_data(material="cocoa")
+sc_customers_df, sc_suppliers_df = read_supply_chain_data(
+    normalize=True, alpha=0.5, material="cocoa"
 )
 sc_customers_df = select_companies(
-    sc_customers_df, nodes_df["id"].tolist(), "source_company"
+    sc_customers_df, nodes_df["Ticker"].tolist(), "target_company"
+)
+sc_customers_df = select_companies(
+    sc_customers_df, nodes_df["Ticker"].tolist(), "source_company"
 )
 sc_suppliers_df = select_companies(
-    sc_suppliers_df, nodes_df["id"].tolist(), "target_company"
+    sc_suppliers_df, nodes_df["Ticker"].tolist(), "target_company"
 )
 sc_suppliers_df = select_companies(
-    sc_suppliers_df, nodes_df["id"].tolist(), "source_company"
+    sc_suppliers_df, nodes_df["Ticker"].tolist(), "source_company"
 )
 print(sc_customers_df.describe())
 
@@ -43,7 +45,7 @@ nodes_df = select_companies(
             + sc_customers_df["target_company"].tolist()
         )
     ),
-    "id",
+    "Ticker",
 )
 
 sc_customer_feature_names = ["revenue_percentage", "relation_size"]
@@ -74,7 +76,7 @@ graph = build_graph(
     sc_customer_feature_names,
     sc_supplier_feature_names,
 )
-nodes_df = nodes_df.set_index("id", drop=False)
+nodes_df = nodes_df.set_index("Ticker", drop=False)
 
 TOP_CENTRALITY_COUNT = 1000
 
@@ -100,7 +102,7 @@ top_closeness_df = nodes_df.sort_values(by=["centrality"], ascending=False).head
 # initial_failures = ["BARN SW Equity"]
 
 # ESG failure based percolation centrality
-initial_failures = nodes_df[nodes_df["ESG Scr"].astype(float) < 3.0]["id"].tolist()
+initial_failures = nodes_df[nodes_df["ESG Scr"].astype(float) < 3.0]["Ticker"].tolist()
 print(f"Initial failures (ESG): {initial_failures}")
 percolation_states = create_percolation_states(graph, initial_failures=initial_failures)
 centralities = percolation_centrality(
@@ -113,7 +115,7 @@ top_percolation_esg_df = nodes_df.sort_values(by=["centrality"], ascending=False
 
 # Financial failure based percolation centrality
 initial_failures = nodes_df[nodes_df["altman_zscore"].astype(float) < 1.81][
-    "id"
+    "Ticker"
 ].tolist()
 print(f"Initial failures (financial): {initial_failures}")
 percolation_states = create_percolation_states(graph, initial_failures=initial_failures)
@@ -126,7 +128,9 @@ top_percolation_financial_df = nodes_df.sort_values(
 ).head(TOP_CENTRALITY_COUNT)
 
 # Geological failure based percolation centrality
-initial_failures = nodes_df[nodes_df["registered_in_country"] == "ID"]["id"].tolist()
+initial_failures = nodes_df[nodes_df["registered_in_country"] == "ID"][
+    "Ticker"
+].tolist()
 print(f"Initial failures (geological): {initial_failures}")
 percolation_states = create_percolation_states(graph, initial_failures=initial_failures)
 centralities = percolation_centrality(
@@ -156,7 +160,7 @@ top_percolation_geo_df = nodes_df.sort_values(by=["centrality"], ascending=False
 # -----------------------------------------------------------------------------------
 # print(
 #     select_companies(
-#         nodes_df, ["BARN SW Equity", "NESN SW Equity", "WMT US Equity"], "id"
+#         nodes_df, ["BARN SW Equity", "NESN SW Equity", "WMT US Equity"], "Ticker"
 #     )
 # )
 # print(select_companies(sc_customers_df, ["NESN SW Equity"], "target_company"))
@@ -164,8 +168,8 @@ top_percolation_geo_df = nodes_df.sort_values(by=["centrality"], ascending=False
 
 # centr_ser = pd.Series(centralities, index=list(centralities.keys())).nlargest(20)
 # centr_df = pd.DataFrame(centr_ser, columns=[centrality_type])
-# centr_df = centr_df.reset_index(drop=False, names="id")
-# centr_df["company_name"] = centr_df["id"].apply(company_name_lookup)
+# centr_df = centr_df.reset_index(drop=False, names="Ticker")
+# centr_df["company_name"] = centr_df["Ticker"].apply(company_name_lookup)
 
 top_betweenness_df["analysis_type"] = "betweenness_centrality"
 top_closeness_df["analysis_type"] = "closeness_centrality"
@@ -189,7 +193,7 @@ plotter.plot(
     group_by="analysis_type",
     # split_by="industry_group",
     split_by="registered_in_country",
-    reference_by="id",
+    reference_by="Ticker",
 )
 
 # plotter = Graphplot(graph)

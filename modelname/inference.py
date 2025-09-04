@@ -9,16 +9,9 @@ import numpy as np
 import torch
 from torch import Tensor
 from torch.nn import Module
-from torch.utils.data import DataLoader
 
-from modelname.dataset import MockDataset
-from modelname.evaluation import MockLoss
-from modelname.model import MockModel
-
-DATASETS = {
-    "mock_dataset": MockDataset,
-    "another_mock_dataset": MockDataset,
-}
+from modelname.dataset import BBGSupplyChainNetwork
+from modelname.autoencoder import SurfConvAutoencoder
 
 
 class BaseInferer:
@@ -26,12 +19,10 @@ class BaseInferer:
 
     def __init__(
         self,
-        dataset: str,
         model: Module | None = None,
         model_path: str | None = None,
         model_params: dict[str, Any] | None = None,
         out_path: str | None = None,
-        metric_name: str = "mock_loss",
         random_seed: int = 0,
         device: str | None = None,
     ) -> None:
@@ -54,7 +45,6 @@ class BaseInferer:
         metric_name: string
             Metric to evaluate the test performance of the model.
         """
-        self.dataset = dataset
         self.device = device
         if device is None:
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -76,15 +66,26 @@ class BaseInferer:
         else:
             self.model = model
 
-        self.dataset = dataset
-        self.metric_name = metric_name
-        if metric_name == "mock_loss":
-            self.metric = MockLoss()
-        else:
-            raise NotImplementedError()
+    def absolute_percentage_errors(self, prediction: Tensor, target: Tensor) -> Tensor:
+        """
+        Calculate the normalized error between prediction and target.
+
+        Parameters
+        ----------
+        prediction: torch Tensor
+            Model prediction.
+        target: torch Tensor
+            Ground truth target.
+
+        Returns
+        -------
+        error: torch Tensor
+            Normalized error.
+        """
+        return torch.abs((prediction - target) / target)
 
     @torch.no_grad()
-    def run(self, mode: str = "test", save_predictions: bool = False) -> Tensor:
+    def run(self, network: BBGSupplyChainNetwork | None = None) -> Tensor:
         """
         Run inference loop whether for testing purposes or in-production.
 
@@ -101,44 +102,15 @@ class BaseInferer:
             Test loss for each sample. Or any metric you will define. Calculates only if test_split_only is True.
         """
         self.model.eval()
-
-        test_dataset = DATASETS[self.dataset](
-            mode=mode,
-            n_folds=1,
-            device=self.device,
-        )
-        test_dataloader = DataLoader(test_dataset, batch_size=1)
-        save_path = os.path.join(
-            ".",
-            "benchmarks",
-            "modelname",
-            self.metric_name,
-            self.dataset,
-        )
-        if not os.path.exists(os.path.join(save_path, "predictions")):
-            os.makedirs(os.path.join(save_path, "predictions"))
-        if not os.path.exists(os.path.join(save_path, "targets")):
-            os.makedirs(os.path.join(save_path, "targets"))
-
-        test_losses = []
-        for s_idx, (input_data, target_label) in enumerate(test_dataloader):
-            prediction = self.model(input_data)
-            if mode == "test":
-                test_loss = self.metric(prediction, target_label)
-                test_losses.append(test_loss.item())
-            if save_predictions:
-                np.savetxt(
-                    os.path.join(save_path, "predictions", f"subject{s_idx}_pred.txt"),
-                    prediction.squeeze(0).cpu().numpy(),
-                )
-            if save_predictions and mode == "test":
-                np.savetxt(
-                    os.path.join(save_path, "targets", f"subject{s_idx}_tgt.txt"),
-                    target_label.squeeze(0).cpu().numpy(),
-                )
+        if network is None:
+            network = BBGSupplyChainNetwork(material="cocoa", device=self.device)
+        graph_data = network.get_pytorch_graph()
+        if graph_data.x is None:
+            raise ValueError("Node features are not defined in the graph data.")
+        out = self.model(graph_data)
 
         self.model.train()
-        return torch.tensor(test_losses)
+        return self.absolute_percentage_errors(out, graph_data.x)
 
     @staticmethod
     def load_model_from_file(
@@ -159,7 +131,7 @@ class BaseInferer:
         model: pytorch Module
             Pretrained model ready for inference, or continue training.
         """
-        model = MockModel(**model_params).to(device)
+        model = SurfConvAutoencoder(**model_params).to(device)
         if not model_path.endswith(".pth"):
             model_path += ".pth"
         model.load_state_dict(
@@ -169,3 +141,55 @@ class BaseInferer:
             )
         )
         return model
+
+
+if __name__ == "__main__":
+    network = BBGSupplyChainNetwork(material="cocoa")
+    inferer = BaseInferer(
+        model_path=os.path.join("models", "default_model_name", "fold0.pth"),
+        model_params={
+            "node_feat_dim": network.num_node_features,
+            "hidden_dim": 128,
+            "latent_dim": 32,
+        },
+        out_path=None,
+    )
+    test_losses = inferer.run(network)
+
+    disruptions = network.create_disruptions(("registered_in_country", "ID"), "equals")
+
+    network.apply_disruptions(
+        # {"BARN SW Equity": 0.5, "NESN SW Equity": 0.2, "WMT US Equity": 0.0},
+        disruptions,
+        ["operating_margin", "profit_margin"],
+    )
+    print(disruptions)
+
+    disrupted_losses = inferer.run(network)
+
+    original_df = network.nodes_df.copy()
+    disrupted_df = network.nodes_df.copy()
+
+    original_df["loss"] = test_losses[:, 0].cpu().numpy()
+    disrupted_df["loss"] = disrupted_losses[:, 0].cpu().numpy()
+
+    import pandas as pd
+
+    original_df["state"] = "original_state"
+    disrupted_df["state"] = "disrupted_state (geological)"
+    combined_df = pd.concat(
+        [
+            original_df,
+            disrupted_df,
+        ]
+    ).reset_index(drop=True)
+
+    from modelname.plotting import Boxplot
+
+    boxplot = Boxplot(combined_df)
+    boxplot.plot(
+        metric="loss",
+        group_by="state",
+        split_by="registered_in_country",
+        reference_by="Ticker",
+    )

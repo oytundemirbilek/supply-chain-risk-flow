@@ -5,75 +5,8 @@ from __future__ import annotations
 import os
 import pandas as pd
 import networkx as nx
-import torch
-from torch import Tensor
 
 FILE_PATH = os.path.dirname(__file__)
-
-
-class EarlyStopping:
-    """Early stopping utility class."""
-
-    def __init__(self, patience: int | None):
-        self.patience = patience
-        self.trigger = 0.0
-        self.last_loss = 100.0
-
-    def step(self, current_loss: float) -> None:
-        """Inspect the current loss comparing to previous one."""
-        if current_loss > self.last_loss:
-            self.trigger += 1
-        else:
-            self.trigger = 0
-        self.last_loss = current_loss
-
-    def check_patience(self) -> bool:
-        """Determine whether the training should be stopped."""
-        if self.patience is None:
-            return False
-        return self.trigger >= self.patience
-
-
-def smoothness_loss(pred, edge_index, edge_weight=None):
-    src, dst = edge_index
-    diff = pred[src] - pred[dst]
-    if edge_weight is not None:
-        return (edge_weight * diff.pow(2).sum(dim=1)).mean()
-    return diff.pow(2).sum(dim=1).mean()
-
-
-def supply_risk(model, graph_data) -> Tensor:
-    x, edge_index, edge_attr = (
-        graph_data.x,
-        graph_data.edge_index,
-        graph_data.edge_attr,
-    )
-
-    # 1. Assuming `model` predicts ESG scores (higher = better)
-    supplier_esg = model(x, edge_index, edge_attr)  # Shape: [num_nodes, 1]
-    supplier_risk = 1 - (supplier_esg / supplier_esg.max())  # Normalized risk
-
-    # Normalize edge weights (USD/revenue%)
-    edge_weight_normalized = edge_attr / edge_attr.max()  # Shape: [num_edges, 1]
-
-    # 2. Edge risk = Supplier risk (src) * Normalized edge weight
-    src_nodes = edge_index[0]  # Suppliers
-    edge_risk = supplier_risk[src_nodes] * edge_weight_normalized
-
-    # 3. Assuming your GNN outputs node embeddings (`h`) before regression
-    # Shape: [num_nodes, embedding_dim]
-    h = model.get_embeddings(x, edge_index, edge_attr)
-    multi_tier_risk = 1 - (h.mean(dim=1) / h.mean(dim=1).max())  # Convert to risk
-
-    # Weighted combination
-    alpha, beta, gamma = 0.6, 0.3, 0.1
-    edge_risk_prob = torch.sigmoid(
-        alpha * supplier_risk[src_nodes]
-        + beta * multi_tier_risk[src_nodes]
-        + gamma * edge_weight_normalized
-    )
-    return edge_risk_prob
-
 
 def depivot_table(
     df: pd.DataFrame,
@@ -88,12 +21,12 @@ def depivot_table(
         f"relation_size_{pivot_name}" + str(number)
         for number in range(1, n_pivot_cols + 1)
     ]
-    # pivot_rev = [
-    #     f"revenue_percentage_{pivot_name}" + str(number)
-    #     for number in range(1, n_pivot_cols + 1)
-    # ]
-    pivot_rev = [
-        f"cost_percentage_{pivot_name}" + str(number)
+    pivot_perc = [
+        (
+            f"cost_percentage_{pivot_name}" + str(number)
+            if pivot_name == "supplier"
+            else f"revenue_percentage_{pivot_name}" + str(number)
+        )
         for number in range(1, n_pivot_cols + 1)
     ]
     pivot_reldate = [
@@ -111,7 +44,7 @@ def depivot_table(
 
     target_companies = []
     target_rel_sizes = []
-    target_revenues = []
+    target_percs = []
     target_year = []
     target_date = []
     target_period = []
@@ -119,40 +52,44 @@ def depivot_table(
     for row, company_row in df.iterrows():
         src_company = company_row[source_column]
         customer_count = 0
-        for tgt_company, tgt_rel_size, tgt_rev, tgt_year, tgt_date, tgt_period in zip(
+        for tgt_company, tgt_rel_size, tgt_perc, tgt_year, tgt_date, tgt_period in zip(
             pivot_columns,
             pivot_relsize,
-            pivot_rev,
+            pivot_perc,
             pivot_reldate,
             pivot_relyear,
             pivot_relperiod,
         ):
-            if company_row[tgt_company].item() == "#N/A N/A":
+            if company_row[tgt_company] == "#N/A N/A":  # type: ignore
                 break
-            if pd.isna(company_row[tgt_company].item()):
+            if pd.isna(company_row[tgt_company]):  # type: ignore
                 break
-            print(company_row[tgt_company])
             target_companies.append(company_row[tgt_company])
             target_rel_sizes.append(company_row[tgt_rel_size])
-            target_revenues.append(company_row[tgt_rev])
+            target_percs.append(company_row[tgt_perc])
             target_year.append(company_row[tgt_year])
             target_date.append(company_row[tgt_date])
             target_period.append(company_row[tgt_period])
             customer_count += 1
         source_companies.extend([src_company] * customer_count)
 
-    return pd.DataFrame(
-        {
-            "source_company": source_companies,
-            "target_company": target_companies,
-            "relation_size": target_rel_sizes,
-            # "revenue_percentage": target_revenues,
-            "cost_percentage": target_revenues,
-            "relation_date": target_date,
-            "relation_year": target_year,
-            "relation_period": target_period,
-        }
+    table_data = {
+        "source_company": source_companies,
+        "target_company": target_companies,
+        "relation_size": target_rel_sizes,
+        # "revenue_percentage": target_revenues,
+        # "cost_percentage": target_costs,
+        "relation_date": target_date,
+        "relation_year": target_year,
+        "relation_period": target_period,
+    }
+    table_data.update(
+        {"cost_percentage": target_percs}
+        if pivot_name == "supplier"
+        else {"revenue_percentage": target_percs}
     )
+
+    return pd.DataFrame(table_data)
 
 
 def filter_supply_chain(
@@ -197,27 +134,35 @@ def inspect_missing_fields(df: pd.DataFrame, features: list[str]) -> None:
         print(f"{feature} - Not applicable: {len(not_applicable)}, NaN: {len(nan_df)}")
 
 
-def read_company_data(root_path: str | None = None) -> pd.DataFrame:
+def read_company_data(
+    root_path: str | None = None, material: str = "cocoa"
+) -> pd.DataFrame:
     """Read and merge all company-level data into one dataframe."""
     if root_path is None:
-        root_path = os.path.join(FILE_PATH, "..", "datasets", "bloomberg_cocoa")
+        root_path = os.path.join(FILE_PATH, "..", "datasets", f"bloomberg_{material}")
 
-    esg_general_path = os.path.join(root_path, "esg", "cocoa_sc_esg_general.csv")
-    esg_env_path = os.path.join(root_path, "esg", "cocoa_sc_esg_env_v2.csv")
-    esg_soc_path = os.path.join(root_path, "esg", "cocoa_sc_esg_soc_v2.csv")
-    esg_gov_path = os.path.join(root_path, "esg", "cocoa_sc_esg_gov_v2.csv")
-    esg_sdg_path = os.path.join(root_path, "esg", "cocoa_sc_esg_sdg_v2.csv")
+    esg_general_path = os.path.join(
+        root_path, "esg", f"{material}_sc_esg_summary_v2.csv"
+    )
+    esg_env_path = os.path.join(root_path, "esg", f"{material}_sc_esg_env_v2.csv")
+    esg_soc_path = os.path.join(root_path, "esg", f"{material}_sc_esg_soc_v2.csv")
+    esg_gov_path = os.path.join(root_path, "esg", f"{material}_sc_esg_gov_v2.csv")
+    esg_sdg_path = os.path.join(root_path, "esg", f"{material}_sc_esg_sdg_v2.csv")
 
     financial_path = os.path.join(
-        root_path, "company_list", "companies_financial_v2_2.csv"
+        root_path, "companies", f"{material}_companies_financial_v3.csv"
     )
-    companies_path = os.path.join(root_path, "company_list", "companies_codes.csv")
+    companies_path = os.path.join(
+        root_path, "companies", f"{material}_companies_info.csv"
+    )
 
-    esg_general_df = pd.read_csv(esg_general_path)
-    esg_env_df = pd.read_csv(esg_env_path)
-    esg_soc_df = pd.read_csv(esg_soc_path)
-    esg_gov_df = pd.read_csv(esg_gov_path)
-    esg_sdg_df = pd.read_csv(esg_sdg_path)
+    esg_general_df = pd.read_csv(
+        esg_general_path, na_values=["#N/A Field Not Applicable", "N.S."]
+    )
+    esg_env_df = pd.read_csv(esg_env_path, na_values="#N/A Field Not Applicable")
+    esg_soc_df = pd.read_csv(esg_soc_path, na_values="#N/A Field Not Applicable")
+    esg_gov_df = pd.read_csv(esg_gov_path, na_values="#N/A Field Not Applicable")
+    esg_sdg_df = pd.read_csv(esg_sdg_path, na_values="#N/A Field Not Applicable")
 
     esg_general_df = esg_general_df.merge(
         esg_env_df,
@@ -248,28 +193,23 @@ def read_company_data(root_path: str | None = None) -> pd.DataFrame:
         how="left",
     )
 
-    financial_df = pd.read_csv(financial_path)
-    companies_df = pd.read_csv(companies_path)
+    financial_df = pd.read_csv(financial_path, na_values="#N/A Field Not Applicable")
+    companies_df = pd.read_csv(companies_path, na_values="#N/A Field Not Applicable")
 
     companies_df = companies_df.merge(
         esg_general_df,
-        left_on="id",
+        left_on="Ticker",
         right_on="Ticker",
         suffixes=(None, None),
         how="left",
     )
     companies_df = companies_df.merge(
         financial_df,
-        left_on="id",
-        right_on="Query",
+        left_on="Ticker",
+        right_on="Ticker",
         suffixes=(None, None),
         how="left",
     )
-    companies_df = companies_df.replace("#N/A Field Not Applicable", pd.NA)
-    companies_df = companies_df.replace("#N/A N/A", pd.NA)
-    companies_df = companies_df.replace("N.S.", pd.NA)
-    companies_df = companies_df.convert_dtypes()
-    print(companies_df.dtypes)
     companies_df["registered_in_country"] = companies_df[
         "registered_in_country"
     ].fillna("Unknown")
@@ -282,27 +222,38 @@ def read_supply_chain_data(
     include_companies: list[str] | None = None,
     normalize: bool = False,
     alpha: float = 0.1,
+    material: str = "cocoa",
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Read suppliers and customers data and optionally filter the companies."""
     if root_path is None:
-        root_path = os.path.join(FILE_PATH, "..", "datasets", "bloomberg_cocoa")
+        root_path = os.path.join(FILE_PATH, "..", "datasets", f"bloomberg_{material}")
 
     sc_customers_path = os.path.join(
         root_path,
-        "cocoa_supply_chain",
-        "cocoa_supply_chain_customers_v2_depivot.csv",
+        "supply_chain_network",
+        f"{material}_supply_chain_customers_v2_depivot.csv",
     )
     sc_suppliers_path = os.path.join(
         root_path,
-        "cocoa_supply_chain",
-        "cocoa_supply_chain_suppliers_v2_depivot.csv",
+        "supply_chain_network",
+        f"{material}_supply_chain_suppliers_v2_depivot.csv",
     )
 
-    sc_customers_df = pd.read_csv(sc_customers_path)
-    sc_suppliers_df = pd.read_csv(sc_suppliers_path)
+    sc_customers_df = pd.read_csv(
+        sc_customers_path, na_values="#N/A Field Not Applicable"
+    )
+    sc_suppliers_df = pd.read_csv(
+        sc_suppliers_path, na_values="#N/A Field Not Applicable"
+    )
     if include_companies is not None:
         sc_customers_df = filter_supply_chain(sc_customers_df, include_companies)
         sc_suppliers_df = filter_supply_chain(sc_suppliers_df, include_companies)
+
+    # for idx, row in sc_suppliers_df.iterrows():
+    #     try:
+    #         row["relation_size"] = float(row["relation_size"])
+    #     except ValueError:
+    #         print(f"Invalid relation size: {row['relation_size']}")
 
     # for group_name, group_df in sc_customers_df.groupby("source_company"):
     #     print(group_name)
@@ -369,8 +320,8 @@ def company_name_lookup(df: pd.DataFrame, ticker: str) -> str | None:
     str
         _description_
     """
-    if ticker in df["id"].to_numpy():
-        return df[df["id"] == ticker]["name"].item()
+    if ticker in df["Ticker"].to_numpy():
+        return df[df["Ticker"] == ticker]["name"].item()
     return None
 
 
@@ -384,7 +335,7 @@ def build_graph(
 ) -> nx.Graph:
     """"""
     if node_feature_names is None:
-        node_feature_names = ["id", "name", "industry_group", "industry_sector"]
+        node_feature_names = ["Ticker", "name", "industry_group", "industry_sector"]
     if sc_customer_feature_names is None:
         sc_customer_feature_names = ["relation_size"]
     if sc_supplier_feature_names is None:
@@ -393,7 +344,7 @@ def build_graph(
     graph = nx.MultiDiGraph()
 
     for _, row in nodes_df.iterrows():
-        graph.add_node(row["id"], **row[node_feature_names].to_dict())
+        graph.add_node(row["Ticker"], **row[node_feature_names].to_dict())
 
     for _, row in sc_customers_df.iterrows():
         graph.add_edge(
@@ -465,16 +416,16 @@ if __name__ == "__main__":
 
     sc_customers_df, sc_suppliers_df = read_supply_chain_data()
     sc_customers_df = select_companies(
-        sc_customers_df, companies_df["id"].tolist(), "target_company"
+        sc_customers_df, companies_df["Ticker"].tolist(), "target_company"
     )
     sc_customers_df = select_companies(
-        sc_customers_df, companies_df["id"].tolist(), "source_company"
+        sc_customers_df, companies_df["Ticker"].tolist(), "source_company"
     )
     sc_suppliers_df = select_companies(
-        sc_suppliers_df, companies_df["id"].tolist(), "target_company"
+        sc_suppliers_df, companies_df["Ticker"].tolist(), "target_company"
     )
     sc_suppliers_df = select_companies(
-        sc_suppliers_df, companies_df["id"].tolist(), "source_company"
+        sc_suppliers_df, companies_df["Ticker"].tolist(), "source_company"
     )
     inspect_missing_fields(sc_customers_df, ["relation_size"])
     inspect_missing_fields(sc_customers_df, ["revenue_percentage"])

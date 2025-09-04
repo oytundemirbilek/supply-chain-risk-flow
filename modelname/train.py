@@ -14,27 +14,18 @@ from torch.optim import AdamW, Optimizer
 from torch_geometric.data import Data as PygData
 from sklearn.metrics import r2_score
 
-from modelname.dataset import SLPCNetworkGraph
-from modelname.model import SurfgateNet
-from modelname.utils import EarlyStopping
+from modelname.dataset import BBGSupplyChainNetwork
+from modelname.autoencoder import SurfConvAutoencoder
 
-# We used 35813 (part of the Fibonacci Sequence) as the seed when we conducted experiments
-np.random.seed(35813)
-torch.manual_seed(35813)
-
-# These two options should be seed to ensure reproducible (If you are using cudnn backend)
-# https://pytorch.org/docs/stable/notes/randomness.html
 if torch.cuda.is_available():
+    # These two options should be seed to ensure reproducible (If you are using cudnn backend)
+    # https://pytorch.org/docs/stable/notes/randomness.html
     from torch.backends import cudnn
 
     cudnn.deterministic = True
     cudnn.benchmark = False
 
 FILE_PATH = os.path.dirname(__file__)
-
-# DATASETS = {
-#     "scn_dataset": SupplyChainNetworkDataset,
-# }
 
 
 class BaseTrainer:
@@ -65,6 +56,7 @@ class BaseTrainer:
         self.device = device
         if device is None:
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"Using device: {self.device}")
         self.random_seed = random_seed
         self.dataset = dataset
         self.n_epochs = n_epochs
@@ -104,19 +96,7 @@ class BaseTrainer:
         optimizer.zero_grad()
 
         out = model.forward(data).squeeze()
-
-        if not isinstance(data.y, Tensor):
-            raise ValueError("Labels should be a tensor.")
-
-        # Primary ESG prediction loss
-        loss_main = self.loss_fn(out[data.train_mask], data.y[data.train_mask])
-
-        # Smoothness loss (optional)
-        # loss_smooth = smoothness_loss(
-        #     out, data.edge_index, data.edge_attr[:, 0]
-        # )  # use revenue_pct as edge weight
-
-        # loss = loss_main + λ * loss_smooth
+        loss_main = self.loss_fn(out, data.x)
         loss_main.backward()
         optimizer.step()
 
@@ -128,35 +108,32 @@ class BaseTrainer:
         model.eval()
         out = model.forward(data).squeeze()
 
-        if not isinstance(data.y, Tensor):
-            raise ValueError("Labels should be a tensor.")
+        if not isinstance(data.x, Tensor):
+            raise ValueError("Data x should be a tensor.")
 
-        # Primary ESG prediction loss
-        loss_main = self.loss_fn(out[data.val_mask], data.y[data.val_mask])
-        r2 = r2_score(
-            data.y[data.val_mask].cpu().numpy(), out[data.val_mask].cpu().numpy()
-        )
+        loss_main = self.loss_fn(out, data.x)
+        r2 = r2_score(data.x.cpu().numpy(), out.cpu().numpy())
 
         model.train()
         return loss_main.item(), r2
 
     def train(self, current_fold: int = 0) -> Module:
         """Train model."""
-        data = SLPCNetworkGraph(device=self.device)
-        data = data.get_pytorch_graph()
-        data.transductive_split()
-        # print(data)
-        model = SurfgateNet(1, 2, 32, 2, 1).to(self.device)
+        network = BBGSupplyChainNetwork(material="cocoa", device=self.device)
+        graph_data = network.get_pytorch_graph()
+        model = SurfConvAutoencoder(graph_data.num_node_features, 128, 32).to(
+            self.device
+        )
         optimizer = AdamW(
             model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay
         )
-        early_stopping = EarlyStopping(self.patience)
+
         best_loss = 99999999999999999999999.0
         for epoch in range(self.n_epochs):
-            train_loss = self.train_step(model, data, optimizer)
+            train_loss = self.train_step(model, graph_data, optimizer)
 
             if (epoch + 1) % self.validation_period == 0:
-                val_loss, val_r2 = self.validate_step(model, data)
+                val_loss, val_r2 = self.validate_step(model, graph_data)
                 print(
                     f"Epoch: {epoch + 1}/{self.n_epochs}",
                     f" | Tr.Loss: {train_loss}",
@@ -164,10 +141,6 @@ class BaseTrainer:
                     f" | Val.R2: {val_r2}",
                 )
                 self.val_loss_per_epoch.append(val_loss)
-
-                early_stopping.step(val_loss)
-                if early_stopping.check_patience():
-                    break
 
                 if val_loss < best_loss:
                     torch.save(
@@ -182,9 +155,9 @@ class BaseTrainer:
 if __name__ == "__main__":
     trainer = BaseTrainer(
         dataset="mock_dataset",
-        n_epochs=1000,
+        n_epochs=100,
         learning_rate=0.001,
-        validation_period=10,
+        validation_period=5,
         # device="cpu",
     )
     trainer.train()
