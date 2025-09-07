@@ -467,63 +467,6 @@ def select_companies(
     return df[df[column].apply(filter_list)]
 
 
-def company_name_lookup(df: pd.DataFrame, ticker: str) -> str | None:
-    """_summary_
-
-    Parameters
-    ----------
-    ticker : str
-        _description_
-
-    Returns
-    -------
-    str
-        _description_
-    """
-    if ticker in df["Ticker"].to_numpy():
-        return df[df["Ticker"] == ticker]["name"].item()
-    return None
-
-
-def build_graph(
-    nodes_df: pd.DataFrame,
-    sc_customers_df: pd.DataFrame,
-    sc_suppliers_df: pd.DataFrame,
-    node_feature_names: list[str] | None = None,
-    sc_customer_feature_names: list[str] | None = None,
-    sc_supplier_feature_names: list[str] | None = None,
-) -> nx.Graph:
-    """"""
-    if node_feature_names is None:
-        node_feature_names = ["Ticker", "name", "industry_group", "industry_sector"]
-    if sc_customer_feature_names is None:
-        sc_customer_feature_names = ["relation_size"]
-    if sc_supplier_feature_names is None:
-        sc_supplier_feature_names = ["relation_size"]
-
-    graph = nx.MultiDiGraph()
-
-    for _, row in nodes_df.iterrows():
-        graph.add_node(row["Ticker"], **row[node_feature_names].to_dict())
-
-    for _, row in sc_customers_df.iterrows():
-        graph.add_edge(
-            u_for_edge=row["source_company"],  # supplier
-            v_for_edge=row["target_company"],  # customer
-            # key="weight",
-            **row[sc_customer_feature_names].to_dict(),
-        )
-
-    for _, row in sc_suppliers_df.iterrows():
-        graph.add_edge(
-            u_for_edge=row["target_company"],  # supplier
-            v_for_edge=row["source_company"],  # customer
-            # key="weight",
-            **row[sc_supplier_feature_names].to_dict(),
-        )
-    return graph
-
-
 def create_percolation_states(
     graph: nx.Graph, initial_failures: list[str]
 ) -> dict[str, float]:
@@ -550,27 +493,6 @@ def create_percolation_states(
 
 
 if __name__ == "__main__":
-
-    # DATA_PATH = os.path.join(FILE_PATH, "..", "datasets", "bloomberg_cocoa")
-    # SC_CUSTOMERS_PATH = os.path.join(DATA_PATH, "cocoa_supply_chain_customers")
-    # EDGES_T1_PATH = os.path.join(
-    #     SC_CUSTOMERS_PATH, "cocoa_supply_chain_template_v3_tier1.csv"
-    # )
-    # EDGES_T2_PATH = os.path.join(
-    #     SC_CUSTOMERS_PATH, "cocoa_supply_chain_template_v3_tier2.csv"
-    # )
-
-    # edges_t1_df = pd.read_csv(EDGES_T1_PATH)
-    # edges_t2_df = pd.read_csv(EDGES_T2_PATH)
-
-    # t1_depivot = depivot_table(edges_t1_df)
-    # t1_depivot["tier"] = "Tier1"
-    # t2_depivot = depivot_table(edges_t2_df, "companies_tier1")
-    # t2_depivot["tier"] = "Tier2"
-
-    # pd.concat([t1_depivot, t2_depivot]).to_csv(
-    #     "cocoa_supply_chain_customers.csv", index=False
-    # )
 
     companies_df = read_company_data()
 

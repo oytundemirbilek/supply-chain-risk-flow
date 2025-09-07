@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Literal
 
+import networkx as nx
 import numpy as np
 import pandas as pd
 import torch
 from torch import Tensor
-from sklearn.preprocessing import MinMaxScaler, StandardScaler
 
 from torch_geometric.data import Data as PygData
 from torch_geometric.utils import to_networkx
@@ -45,9 +45,9 @@ class SupplyChainNetwork:
         self.node_feature_names = node_feature_names
         self.edge_feature_names = edge_feature_names
         self.node_identifier = node_identifier
-        # self.nodes_df = process_company_data(nodes_df)
         self.nodes_df = nodes_df.reset_index(drop=True)
         print(self.nodes_df.head())
+
         self.edges_df = match_supply_chain_companies(
             sc_customers_df, sc_suppliers_df, nodes_df
         ).reset_index(drop=True)
@@ -71,6 +71,7 @@ class SupplyChainNetwork:
             edge_index=self.pyg_edge_index,
             edge_attr=self.pyg_edge_attr,
         )
+        self.nx_graph = self.create_networkx_graph(self.nodes_df, self.edges_df)
 
         self.data_nan_check()
         self.sanity_check()
@@ -81,7 +82,7 @@ class SupplyChainNetwork:
 
     def get_networkx_graph(self) -> Graph:
         """Get the NetworkX graph representation."""
-        return to_networkx(self.graph_data, to_undirected=True)
+        return self.nx_graph
 
     @staticmethod
     def replace_string_nans(df: pd.DataFrame) -> pd.DataFrame:
@@ -93,21 +94,6 @@ class SupplyChainNetwork:
         """Cast specified columns of the DataFrame to float type."""
         for column in columns:
             df[column] = pd.to_numeric(df[column], errors="coerce")
-        return df
-
-    @staticmethod
-    def normalize_features(df: pd.DataFrame, column: str) -> pd.DataFrame:
-        """Normalize specified column using StandardScaler."""
-        scaler = StandardScaler()
-        df[[column]] = scaler.fit_transform(df[[column]])
-        return df
-
-    @staticmethod
-    def normalize_with_logscale(df: pd.DataFrame, column: str) -> pd.DataFrame:
-        """Normalize specified column using log scale followed by MinMaxScaler."""
-        df[column] = df[column].apply(lambda x: np.log1p(x) if x > 0 else 0)
-        scaler = MinMaxScaler()
-        df[[column]] = scaler.fit_transform(df[[column]])
         return df
 
     def company_index_lookup(self, ticker: str) -> int | None:
@@ -129,6 +115,38 @@ class SupplyChainNetwork:
             ].index.item()
         return None
 
+    def create_networkx_graph(
+        self,
+        nodes_df: pd.DataFrame,
+        edges_df: pd.DataFrame,
+        node_feature_names: list[str] | None = None,
+        edge_feature_names: list[str] | None = None,
+    ) -> nx.Graph:
+        """"""
+        if node_feature_names is None:
+            node_feature_names = ["Ticker", "name", "industry_group", "industry_sector"]
+        if edge_feature_names is None:
+            edge_feature_names = [
+                "relation_size",
+                "revenue_percentage",
+                "cost_percentage",
+            ]
+
+        graph = nx.MultiDiGraph()
+
+        for _, row in nodes_df.iterrows():
+            graph.add_node(row["Ticker"], **row[node_feature_names].to_dict())
+
+        for _, row in edges_df.iterrows():
+            graph.add_edge(
+                u_for_edge=row["source_company"],  # supplier
+                v_for_edge=row["target_company"],  # customer
+                # key="weight",
+                **row[edge_feature_names].to_dict(),
+            )
+
+        return graph
+
     def create_pyg_nodes(self) -> Tensor:
         """"""
         self.nodes_df = self.replace_string_nans(self.nodes_df)
@@ -147,7 +165,6 @@ class SupplyChainNetwork:
         """
         self.edges_df = self.replace_string_nans(self.edges_df)
         self.edges_df = self.cast_as_float(self.edges_df, self.edge_feature_names)
-        # self.edges_df = self.normalize_with_logscale(self.edges_df, "relation_size")
 
         src_indices = torch.from_numpy(
             self.edges_df["source_company"]
@@ -187,6 +204,8 @@ class SupplyChainNetwork:
         if self.pyg_edge_attr.shape[1] != self.num_edge_features:
             raise ValueError("Edge feature dim mismatch.")
         print("Sanity check passed: Graph data is consistent.")
+        print(self.graph_data)
+        print(self.nx_graph)
 
     def data_nan_check(self) -> None:
         """Check for NaN values in the graph data."""
@@ -280,40 +299,6 @@ class SupplyChainNetwork:
 
         self.graph_data.x = self.pyg_nodes
 
-    # def drop_missing_nodes(self) -> None:
-    #     """Drop nodes with missing features."""
-    #     initial_node_count = self.num_nodes
-    #     self.nodes_df.dropna(subset=self.node_feature_names, inplace=True)
-    #     self.nodes_df.reset_index(drop=True, inplace=True)
-    #     self.num_nodes = len(self.nodes_df)
-    #     print(
-    #         f"Dropped {initial_node_count - self.num_nodes} nodes with missing features."
-    #     )
-    #     self.pyg_nodes = self.create_pyg_nodes()
-    #     self.pyg_edge_attr, self.pyg_edge_index = self.create_pyg_edges()
-    #     self.graph_data = PygData(
-    #         x=self.pyg_nodes,
-    #         edge_index=self.pyg_edge_index,
-    #         edge_attr=self.pyg_edge_attr,
-    #     )
-
-    # def drop_missing_edges(self) -> None:
-    #     """Drop edges with missing features."""
-    #     initial_edge_count = self.num_edges
-    #     self.edges_df.dropna(subset=self.edge_feature_names, inplace=True)
-    #     self.edges_df.reset_index(drop=True, inplace=True)
-    #     self.num_edges = len(self.edges_df)
-    #     print(
-    #         f"Dropped {initial_edge_count - self.num_edges} edges with missing features."
-    #     )
-    #     self.pyg_nodes = self.create_pyg_nodes()
-    #     self.pyg_edge_attr, self.pyg_edge_index = self.create_pyg_edges()
-    #     self.graph_data = PygData(
-    #         x=self.pyg_nodes,
-    #         edge_index=self.pyg_edge_index,
-    #         edge_attr=self.pyg_edge_attr,
-    #     )
-
 
 class BBGSupplyChainNetwork(SupplyChainNetwork):
     """Class to handle Bloomberg supply chain network graph data."""
@@ -399,7 +384,8 @@ class BBGSupplyChainNetwork(SupplyChainNetwork):
 
 if __name__ == "__main__":
     network = BBGSupplyChainNetwork(material="cocoa")
-    original_graph = network.get_pytorch_graph()  # .clone()
+    original_graph = network.get_pytorch_graph()
+    assert original_graph.x is not None
     print(original_graph.x[97])
     network.apply_disruptions(
         {"BARN SW Equity": 0.5, "NESN SW Equity": 0.2, "WMT US Equity": 0.0},
