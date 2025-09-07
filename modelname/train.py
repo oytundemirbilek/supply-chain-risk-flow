@@ -12,10 +12,11 @@ from torch.nn import Module
 from torch.nn.modules.loss import MSELoss
 from torch.optim import AdamW, Optimizer
 from torch_geometric.data import Data as PygData
+import torch.nn.functional as F
 from sklearn.metrics import r2_score
 
 from modelname.dataset import BBGSupplyChainNetwork
-from modelname.autoencoder import SurfConvAutoencoder
+from modelname.autoencoder import SurfNNConvCrossModalityAutoencoder
 
 if torch.cuda.is_available():
     # These two options should be seed to ensure reproducible (If you are using cudnn backend)
@@ -26,6 +27,12 @@ if torch.cuda.is_available():
     cudnn.benchmark = False
 
 FILE_PATH = os.path.dirname(__file__)
+
+
+def compute_loss(x_true, x_recon, edge_true, edge_recon, lambda_edge=0.1):
+    L_attr = F.mse_loss(x_recon, x_true)  # node features
+    L_edge = F.mse_loss(edge_recon, edge_true)  # edge weights (continuous)
+    return L_attr + lambda_edge * L_edge
 
 
 class BaseTrainer:
@@ -95,35 +102,51 @@ class BaseTrainer:
         model.train()
         optimizer.zero_grad()
 
-        out = model.forward(data).squeeze()
-        loss_main = self.loss_fn(out, data.x)
+        nodes_out, edges_out = model.forward(data)
+        loss_main = compute_loss(data.x, nodes_out, data.edge_attr, edges_out)
         loss_main.backward()
         optimizer.step()
 
         return loss_main.item()
 
     @torch.no_grad()
-    def validate_step(self, model: Module, data: PygData) -> tuple[float, float]:
+    def validate_step(self, model: Module, data: PygData) -> dict[str, float]:
         """Run validation loop."""
         model.eval()
-        out = model.forward(data).squeeze()
+        nodes_out, edges_out = model.forward(data)
 
         if not isinstance(data.x, Tensor):
             raise ValueError("Data x should be a tensor.")
 
-        loss_main = self.loss_fn(out, data.x)
-        r2 = r2_score(data.x.cpu().numpy(), out.cpu().numpy())
+        if not isinstance(data.edge_attr, Tensor):
+            raise ValueError("Data edge attributes should be a tensor.")
+
+        # print(edges_out)
+        # print(data.edge_attr)
+
+        loss_main = compute_loss(data.x, nodes_out, data.edge_attr, edges_out)
+        r2_nodes = r2_score(data.x.cpu().numpy(), nodes_out.cpu().numpy())
+        r2_edges = r2_score(data.edge_attr.cpu().numpy(), edges_out.cpu().numpy())
+
+        # print(f"Original nodes: {data.x}")
+        # print(f"Reconstructed nodes: {nodes_out}")
+
+        loss_dict = {
+            "val_loss": loss_main.item(),
+            "val_r2_nodes": r2_nodes,
+            "val_r2_edges": r2_edges,
+        }
 
         model.train()
-        return loss_main.item(), r2
+        return loss_dict
 
     def train(self, current_fold: int = 0) -> Module:
         """Train model."""
-        network = BBGSupplyChainNetwork(material="cocoa", device=self.device)
+        network = BBGSupplyChainNetwork(material=self.dataset, device=self.device)
         graph_data = network.get_pytorch_graph()
-        model = SurfConvAutoencoder(graph_data.num_node_features, 128, 32).to(
-            self.device
-        )
+        model = SurfNNConvCrossModalityAutoencoder(
+            graph_data.num_node_features, graph_data.num_edge_features, 128, 32
+        ).to(self.device)
         optimizer = AdamW(
             model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay
         )
@@ -133,13 +156,16 @@ class BaseTrainer:
             train_loss = self.train_step(model, graph_data, optimizer)
 
             if (epoch + 1) % self.validation_period == 0:
-                val_loss, val_r2 = self.validate_step(model, graph_data)
+                val_loss_dict = self.validate_step(model, graph_data)
+                msg = " | ".join(
+                    [f"{key}: {value:.4f}" for key, value in val_loss_dict.items()]
+                )
                 print(
                     f"Epoch: {epoch + 1}/{self.n_epochs}",
-                    f" | Tr.Loss: {train_loss}",
-                    f" | Val.Loss: {val_loss}",
-                    f" | Val.R2: {val_r2}",
+                    f" | Tr.Loss: {train_loss:.4f}",
+                    msg,
                 )
+                val_loss = val_loss_dict["val_loss"]
                 self.val_loss_per_epoch.append(val_loss)
 
                 if val_loss < best_loss:
@@ -154,10 +180,11 @@ class BaseTrainer:
 
 if __name__ == "__main__":
     trainer = BaseTrainer(
-        dataset="mock_dataset",
-        n_epochs=100,
+        dataset="cocoa",
+        n_epochs=1000,
         learning_rate=0.001,
-        validation_period=5,
+        validation_period=20,
+        model_name="cross_modality_model_rel_size",
         # device="cpu",
     )
     trainer.train()

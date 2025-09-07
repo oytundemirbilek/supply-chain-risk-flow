@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import os
+import numpy as np
 import pandas as pd
 import networkx as nx
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 
 FILE_PATH = os.path.dirname(__file__)
+
 
 def depivot_table(
     df: pd.DataFrame,
@@ -214,14 +217,190 @@ def read_company_data(
         "registered_in_country"
     ].fillna("Unknown")
 
+    companies_df["operating_state"] = 1.0
+
     return companies_df
+
+
+def match_supply_chain_companies(
+    sc_customers_df: pd.DataFrame,
+    sc_suppliers_df: pd.DataFrame,
+    companies_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Match the companies in the supply chain data to ensure consistency.
+
+    Parameters
+    ----------
+    sc_customers_df : pd.DataFrame
+        _description_
+    sc_suppliers_df : pd.DataFrame
+        _description_
+    companies_df : pd.DataFrame
+        _description_
+
+    Returns
+    -------
+    pd.DataFrame
+        _description_
+    """
+
+    merged_df = sc_customers_df.merge(
+        sc_suppliers_df,
+        left_on=["source_company", "target_company"],
+        right_on=["target_company", "source_company"],
+        how="outer",
+        suffixes=("_customer", "_supplier"),
+    )
+    for col in [
+        "relation_size",
+        "relation_date",
+        "relation_year",
+        "relation_period",
+    ]:
+        combined = merged_df[col + "_customer"].combine_first(
+            merged_df[col + "_supplier"]
+        )
+        merged_df[col + "_supplier"] = combined
+        merged_df[col + "_customer"] = combined
+
+    combine_suppliers = merged_df["source_company_supplier"].combine_first(
+        merged_df["target_company_customer"]
+    )
+    merged_df["source_company_supplier"] = combine_suppliers
+    merged_df["target_company_customer"] = combine_suppliers
+
+    combine_customers = merged_df["source_company_customer"].combine_first(
+        merged_df["target_company_supplier"]
+    )
+    merged_df["source_company_customer"] = combine_customers
+    merged_df["target_company_supplier"] = combine_customers
+
+    for group_name, group_df in merged_df.groupby("source_company_customer"):
+        revenue = companies_df.loc[
+            companies_df["Ticker"] == group_name, "revenue"
+        ].values
+        if len(revenue) > 0:
+            revenue = revenue[0]
+        else:
+            revenue = np.nan
+        # print(f"Company: {group_name}, Revenue: {revenue}")
+        rev_perc = 100 * group_df["relation_size_customer"] / revenue
+        # print(f"Revenue percentages: {rev_perc}")
+        # Update merged_df directly for the current group
+        idx = group_df.index
+        merged_df.loc[idx, "revenue_percentage"] = merged_df.loc[
+            idx, "revenue_percentage"
+        ].fillna(rev_perc)
+
+    for group_name, group_df in merged_df.groupby("source_company_supplier"):
+        group_cost_info = group_df.dropna(subset=["cost_percentage"])
+        if group_cost_info.empty:
+            print(f"Could not found cost info for company: {group_name}")
+            continue
+        cost_perc_first = group_cost_info["cost_percentage"].to_numpy()[0]
+        relation_size = group_cost_info["relation_size_supplier"].to_numpy()[0]
+        total_cost = 100 * relation_size / cost_perc_first
+        # print(f"Company: {group_name}, Total Cost: {total_cost}")
+
+        cost_perc = 100 * group_df["relation_size_supplier"] / total_cost
+        # print(f"Cost percentages: {cost_perc}")
+        # Update merged_df directly for the current group
+        idx = group_df.index
+        merged_df.loc[idx, "cost_percentage"] = merged_df.loc[
+            idx, "cost_percentage"
+        ].fillna(cost_perc)
+
+    for col in [
+        "relation_size",
+        "relation_date",
+        "relation_year",
+        "relation_period",
+        "source_company",
+        "target_company",
+    ]:
+        merged_df.rename(columns={f"{col}_customer": col}, inplace=True)
+
+    return merged_df
+
+
+def process_supply_chain_relations(
+    df: pd.DataFrame,
+    normalize: bool = True,
+    log_transform: bool = True,
+    reverse_transform: bool = False,
+) -> pd.DataFrame:
+    """"""
+    # Apply log transformation to relation sizes to reduce skewness
+    df["relation_size_normed"] = df["relation_size"]
+    if log_transform:
+        df["relation_size_normed"] = np.log(df["relation_size_normed"].to_numpy())
+    if reverse_transform:
+        df["relation_size_normed"] = 1 / (df["relation_size_normed"].to_numpy())
+    if normalize:
+        # Normalize relation sizes
+        df["relation_size_normed"] = (
+            df["relation_size_normed"] - df["relation_size_normed"].min()
+        ) / (df["relation_size_normed"].max() - df["relation_size_normed"].min())
+    df["revenue_percentage"] = df["revenue_percentage"] / 100
+    df["cost_percentage"] = df["cost_percentage"] / 100
+    return df
+
+
+def process_company_data(df: pd.DataFrame) -> pd.DataFrame:
+    """_summary_
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        _description_
+
+    Returns
+    -------
+    pd.DataFrame
+        _description_
+    """
+    negative_possibles = [
+        "ROA",
+        "operating_margin",
+        "profit_margin",
+        "current_ratio",
+        "debt_to_equity_ratio",
+        "altman_zscore",
+        "inventory_turnover",
+        "cash_conversion_cycle",
+        "free_cash_flow",
+    ]
+    percentages = [
+        "asset_damage_rate",
+        "cocoa_revenue_percentage",
+    ]
+
+    heavy_tailed = [
+        "at_risk_commodity_revenue",
+        "supplier_count_forest_risk",
+        "cocoa_income_supplier_count",
+        "revenue",
+        "Mkt Cap",
+        "total_assets",
+    ]
+
+    z_scaler = StandardScaler()
+    df[negative_possibles] = z_scaler.fit_transform(df[negative_possibles])
+
+    df[percentages] = df[percentages] / 100
+
+    df["at_risk_commodity_revenue"] = df["at_risk_commodity_revenue"] / 1_000_000
+
+    mm_scaler = MinMaxScaler()
+    df[heavy_tailed] = np.log1p(df[heavy_tailed])
+    df[heavy_tailed] = mm_scaler.fit_transform(df[heavy_tailed])
+
+    return df
 
 
 def read_supply_chain_data(
     root_path: str | None = None,
     include_companies: list[str] | None = None,
-    normalize: bool = False,
-    alpha: float = 0.1,
     material: str = "cocoa",
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Read suppliers and customers data and optionally filter the companies."""
@@ -258,25 +437,6 @@ def read_supply_chain_data(
     # for group_name, group_df in sc_customers_df.groupby("source_company"):
     #     print(group_name)
     #     print(group_df)
-
-    if normalize:
-        # Normalize relation sizes
-        sc_suppliers_df = sc_suppliers_df[sc_suppliers_df["relation_size"] > 0]
-        sc_customers_df = sc_customers_df[sc_customers_df["relation_size"] > 0]
-        sc_suppliers_df["relation_size"] = (
-            sc_suppliers_df["relation_size"] / sc_suppliers_df["relation_size"].max()
-        )
-        sc_customers_df["relation_size"] = (
-            sc_customers_df["relation_size"] / sc_customers_df["relation_size"].max()
-        )
-
-    # Apply power-law transformation to relation sizes to reduce skewness
-    sc_suppliers_df["relation_size_normed"] = (
-        1 / (sc_suppliers_df["relation_size"]) ** alpha
-    )
-    sc_customers_df["relation_size_normed"] = (
-        1 / (sc_customers_df["relation_size"]) ** alpha
-    )
 
     return sc_customers_df, sc_suppliers_df
 

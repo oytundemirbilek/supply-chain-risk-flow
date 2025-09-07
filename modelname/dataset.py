@@ -8,12 +8,19 @@ import numpy as np
 import pandas as pd
 import torch
 from torch import Tensor
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
 
 from torch_geometric.data import Data as PygData
 from torch_geometric.utils import to_networkx
 
-from modelname.utils import read_company_data, read_supply_chain_data, select_companies
+from modelname.utils import (
+    process_company_data,
+    process_supply_chain_relations,
+    read_company_data,
+    read_supply_chain_data,
+    select_companies,
+    match_supply_chain_companies,
+)
 
 if TYPE_CHECKING:
     from networkx import Graph
@@ -38,11 +45,18 @@ class SupplyChainNetwork:
         self.node_feature_names = node_feature_names
         self.edge_feature_names = edge_feature_names
         self.node_identifier = node_identifier
-
+        # self.nodes_df = process_company_data(nodes_df)
         self.nodes_df = nodes_df.reset_index(drop=True)
-        self.edges_df = pd.concat([sc_customers_df, sc_suppliers_df]).reset_index(
-            drop=True
-        )
+        print(self.nodes_df.head())
+        self.edges_df = match_supply_chain_companies(
+            sc_customers_df, sc_suppliers_df, nodes_df
+        ).reset_index(drop=True)
+        self.edges_df = process_supply_chain_relations(self.edges_df)
+        self.edges_df.dropna(subset=edge_feature_names, inplace=True)
+        self.edges_df.reset_index(drop=True, inplace=True)
+        self.edges_df.to_csv("edges_debug.csv", index=False)
+        print(self.edges_df.head())
+        print(self.edges_df.describe())
 
         self.num_nodes = len(self.nodes_df)
         self.num_edges = len(self.edges_df)
@@ -119,8 +133,7 @@ class SupplyChainNetwork:
         """"""
         self.nodes_df = self.replace_string_nans(self.nodes_df)
         self.nodes_df = self.cast_as_float(self.nodes_df, self.node_feature_names)
-        for node_feature_name in self.node_feature_names:
-            self.nodes_df = self.normalize_features(self.nodes_df, node_feature_name)
+        self.nodes_df = process_company_data(self.nodes_df)
         nodes = self.nodes_df[self.node_feature_names].to_numpy()
         return torch.from_numpy(nodes).float().to(self.device)
 
@@ -150,7 +163,6 @@ class SupplyChainNetwork:
 
         edge_attr = (
             torch.from_numpy(self.edges_df[self.edge_feature_names].to_numpy())
-            .squeeze()
             .float()
             .to(self.device)
         )
@@ -172,8 +184,8 @@ class SupplyChainNetwork:
             raise ValueError("Edge index contains negative values.")
         if self.pyg_edge_index.max() >= self.num_nodes:
             raise ValueError("Edge index exceeds number of nodes.")
-        # if self.pyg_edge_attr.shape[1] != self.num_edge_features:
-        #     raise ValueError("Edge feature dim mismatch.")
+        if self.pyg_edge_attr.shape[1] != self.num_edge_features:
+            raise ValueError("Edge feature dim mismatch.")
         print("Sanity check passed: Graph data is consistent.")
 
     def data_nan_check(self) -> None:
@@ -308,36 +320,45 @@ class BBGSupplyChainNetwork(SupplyChainNetwork):
 
     def __init__(
         self,
-        material: Literal["cocoa", "coffee", "palm_oil"] = "cocoa",
+        material: Literal["cocoa", "tantalum"] = "cocoa",
         node_identifier: str = "Ticker",
+        node_feature_names: list[str] | None = None,
+        edge_feature_names: list[str] | None = None,
         device: str | None = None,
     ) -> None:
-        node_feature_names = [
-            "operating_margin",
-            "profit_margin",
-            "current_ratio",
-            "debt_to_equity_ratio",
-            "altman_zscore",
-            # "at_risk_commodity_revenue",
-            # "supplier_count_forest_risk",
-            # "cocoa_revenue_percentage",
-            # "cocoa_income_supplier_count",
-        ]
+        if node_feature_names is None:
+            node_feature_names = [
+                "operating_state",
+                # Derived financial ratios:
+                "operating_margin",
+                "profit_margin",
+                "current_ratio",
+                "debt_to_equity_ratio",
+                "inventory_turnover",
+                "ROA",
+                "free_cash_flow",
+                "cash_conversion_cycle",
+                "altman_zscore",
+                # Basis financial metrics:
+                "revenue",
+                "total_assets",
+                "Mkt Cap",
+                # "at_risk_commodity_revenue",
+                # "supplier_count_forest_risk",
+                # "cocoa_revenue_percentage",
+                # "cocoa_income_supplier_count",
+            ]
         # sc_customer_feature_names = ["revenue_percentage", "relation_size"]
         # sc_supplier_feature_names = ["cost_percentage", "relation_size"]
         # edge_feature_names = sc_customer_feature_names + sc_supplier_feature_names
-        edge_feature_names = ["relation_size"]
+        if edge_feature_names is None:
+            edge_feature_names = ["revenue_percentage"]
+        # edge_feature_names = ["relation_size_normed"]
         nodes_df = read_company_data(material=material)
         nodes_df.dropna(subset=node_feature_names, inplace=True)
         nodes_df.reset_index(drop=True, inplace=True)
 
-        sc_customers_df, sc_suppliers_df = read_supply_chain_data(
-            normalize=True, alpha=0.5, material=material
-        )
-        sc_customers_df.dropna(subset=edge_feature_names, inplace=True)
-        sc_customers_df.reset_index(drop=True, inplace=True)
-        sc_suppliers_df.dropna(subset=edge_feature_names, inplace=True)
-        sc_suppliers_df.reset_index(drop=True, inplace=True)
+        sc_customers_df, sc_suppliers_df = read_supply_chain_data(material=material)
 
         sc_customers_df = select_companies(
             sc_customers_df, nodes_df["Ticker"].tolist(), "target_company"
@@ -351,7 +372,6 @@ class BBGSupplyChainNetwork(SupplyChainNetwork):
         sc_suppliers_df = select_companies(
             sc_suppliers_df, nodes_df["Ticker"].tolist(), "source_company"
         )
-        print(sc_customers_df.describe())
 
         nodes_df = select_companies(
             nodes_df,
@@ -380,9 +400,9 @@ class BBGSupplyChainNetwork(SupplyChainNetwork):
 if __name__ == "__main__":
     network = BBGSupplyChainNetwork(material="cocoa")
     original_graph = network.get_pytorch_graph()  # .clone()
-    print(original_graph.x[88])
+    print(original_graph.x[97])
     network.apply_disruptions(
         {"BARN SW Equity": 0.5, "NESN SW Equity": 0.2, "WMT US Equity": 0.0},
         ["operating_margin", "profit_margin"],
     )
-    print(original_graph.x[88])
+    print(original_graph.x[97])

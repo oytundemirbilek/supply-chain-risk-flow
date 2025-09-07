@@ -11,7 +11,7 @@ from torch import Tensor
 from torch.nn import Module
 
 from modelname.dataset import BBGSupplyChainNetwork
-from modelname.autoencoder import SurfConvAutoencoder
+from modelname.autoencoder import SurfNNConvCrossModalityAutoencoder
 
 
 class BaseInferer:
@@ -85,7 +85,9 @@ class BaseInferer:
         return torch.abs((prediction - target) / target)
 
     @torch.no_grad()
-    def run(self, network: BBGSupplyChainNetwork | None = None) -> Tensor:
+    def run(
+        self, network: BBGSupplyChainNetwork | None = None
+    ) -> tuple[Tensor, Tensor]:
         """
         Run inference loop whether for testing purposes or in-production.
 
@@ -107,10 +109,10 @@ class BaseInferer:
         graph_data = network.get_pytorch_graph()
         if graph_data.x is None:
             raise ValueError("Node features are not defined in the graph data.")
-        out = self.model(graph_data)
+        nodes_out, edges_out = self.model(graph_data)
 
         self.model.train()
-        return self.absolute_percentage_errors(out, graph_data.x)
+        return nodes_out, edges_out
 
     @staticmethod
     def load_model_from_file(
@@ -131,7 +133,7 @@ class BaseInferer:
         model: pytorch Module
             Pretrained model ready for inference, or continue training.
         """
-        model = SurfConvAutoencoder(**model_params).to(device)
+        model = SurfNNConvCrossModalityAutoencoder(**model_params).to(device)
         if not model_path.endswith(".pth"):
             model_path += ".pth"
         model.load_state_dict(
@@ -146,32 +148,40 @@ class BaseInferer:
 if __name__ == "__main__":
     network = BBGSupplyChainNetwork(material="cocoa")
     inferer = BaseInferer(
-        model_path=os.path.join("models", "default_model_name", "fold0.pth"),
+        model_path=os.path.join("models", "cross_modality_model_rel_size", "fold0.pth"),
         model_params={
             "node_feat_dim": network.num_node_features,
+            "edge_feat_dim": network.num_edge_features,
             "hidden_dim": 128,
             "latent_dim": 32,
         },
         out_path=None,
     )
-    test_losses = inferer.run(network)
+    pred_nodes, pred_edges = inferer.run(network)
+    test_losses = inferer.absolute_percentage_errors(pred_nodes, network.graph_data.x)
 
     disruptions = network.create_disruptions(("registered_in_country", "ID"), "equals")
 
     network.apply_disruptions(
         # {"BARN SW Equity": 0.5, "NESN SW Equity": 0.2, "WMT US Equity": 0.0},
         disruptions,
-        ["operating_margin", "profit_margin"],
+        ["operating_state"],
     )
     print(disruptions)
 
-    disrupted_losses = inferer.run(network)
+    disrupted_pred_nodes, disrupted_pred_edges = inferer.run(network)
+    disrupted_losses = inferer.absolute_percentage_errors(
+        disrupted_pred_nodes, network.graph_data.x
+    )
 
     original_df = network.nodes_df.copy()
     disrupted_df = network.nodes_df.copy()
 
     original_df["loss"] = test_losses[:, 0].cpu().numpy()
     disrupted_df["loss"] = disrupted_losses[:, 0].cpu().numpy()
+
+    original_df["operating_state"] = pred_nodes[:, 0].cpu().numpy()
+    disrupted_df["operating_state"] = disrupted_pred_nodes[:, 0].cpu().numpy()
 
     import pandas as pd
 
@@ -186,9 +196,11 @@ if __name__ == "__main__":
 
     from modelname.plotting import Boxplot
 
+    print(combined_df)
+
     boxplot = Boxplot(combined_df)
     boxplot.plot(
-        metric="loss",
+        metric="operating_state",
         group_by="state",
         split_by="registered_in_country",
         reference_by="Ticker",
