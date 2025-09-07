@@ -147,6 +147,7 @@ class BaseInferer:
 
 if __name__ == "__main__":
     network = BBGSupplyChainNetwork(material="cocoa")
+    assert network.graph_data.x is not None
     inferer = BaseInferer(
         model_path=os.path.join("models", "cross_modality_model_rel_size", "fold0.pth"),
         model_params={

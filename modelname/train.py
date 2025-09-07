@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from typing import Literal
 
 import numpy as np
 import torch
@@ -41,14 +42,12 @@ class BaseTrainer:
     def __init__(  # noqa: PLR0913
         self,
         # Data related:
-        dataset: str,
+        dataset: Literal["cocoa", "tantalum"],
         # Training related:
         n_epochs: int,
         learning_rate: float,
         weight_decay: float = 0.001,
-        batch_size: int = 1,
         validation_period: int = 5,
-        patience: int | None = None,
         # Model related:
         n_folds: int = 5,
         layer_sizes: tuple[int, ...] = (8, 16),
@@ -65,13 +64,11 @@ class BaseTrainer:
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"Using device: {self.device}")
         self.random_seed = random_seed
-        self.dataset = dataset
+        self.dataset: Literal["cocoa", "tantalum"] = dataset
         self.n_epochs = n_epochs
         self.n_folds = n_folds
-        self.batch_size = batch_size
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
-        self.patience = patience
         self.validation_period = validation_period
         self.loss_weight = loss_weight
         self.loss_name = loss_name
